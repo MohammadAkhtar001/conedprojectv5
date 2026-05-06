@@ -126,18 +126,40 @@ Output schema:
 }}"""
 
         attempts: list[ExtractionAttempt] = []
+        text = ""
+        used_search = False
         try:
-            msg = client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=2000,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            )
+            # Try with web_search first; some models (Haiku family) don't
+            # support tools and will 400.  Fall back to no-tools mode in
+            # that case — Claude can still attempt the answer from training
+            # data, and we lower the confidence accordingly.
+            try:
+                msg = client.messages.create(
+                    model="claude-3-5-sonnet-latest",
+                    max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                )
+                used_search = True
+            except Exception as search_err:
+                err_str = str(search_err).lower()
+                if ("tool" in err_str or "web_search" in err_str
+                        or "not supported" in err_str or "400" in err_str):
+                    log.info("web_search not supported by model; retrying without tools")
+                    msg = client.messages.create(
+                        model="claude-3-5-sonnet-latest",
+                        max_tokens=2000,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                else:
+                    raise
+
             text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
 
             # Log a synthetic attempt so the audit trail shows the AI was tried.
             attempts.append(ExtractionAttempt(
-                source=self.source_name, url="anthropic://messages",
+                source=self.source_name + (" (with web_search)" if used_search else " (no search)"),
+                url="anthropic://messages",
                 method="POST", status_code=200,
                 content_type="application/json",
                 response_bytes=len(text or ""),
@@ -192,6 +214,16 @@ Output schema:
         if not isinstance(confidence, (int, float)):
             confidence = self.base_confidence
         confidence = max(0.30, min(0.85, float(confidence)))
+        # Without web_search, the AI is answering from training data — cap
+        # confidence at 0.45 so this never looks like a regulator-grade source.
+        if not used_search:
+            confidence = min(confidence, 0.45)
+
+        notes_text = parsed.get("notes") or ""
+        if not used_search:
+            notes_text = ("[no web_search available on this model — value "
+                          "from training data only, treat as low-confidence] "
+                          + notes_text)
 
         return DataPoint(
             company=company.name, metric=metric,
@@ -202,7 +234,7 @@ Output schema:
             source_name=f"{self.source_name} → {parsed.get('source_name', 'unknown')}",
             confidence_score=confidence,
             attempts=attempts,
-            notes=parsed.get("notes"),
+            notes=notes_text,
         )
 
     @staticmethod
