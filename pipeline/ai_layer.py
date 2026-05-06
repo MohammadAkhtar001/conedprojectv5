@@ -82,7 +82,7 @@ Write 2–4 sentences summarizing data quality, then list any specific values yo
 
     try:
         msg = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-latest",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -127,7 +127,7 @@ Return a markdown bullet list. Use **bold** for headlines."""
 
     try:
         msg = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-latest",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -379,7 +379,7 @@ Return ONLY the JSON object — no prose, no markdown fences."""
 
     try:
         msg = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-latest",
             max_tokens=3000,
             messages=[{"role": "user", "content": prompt}],
         )
