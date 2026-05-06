@@ -84,11 +84,11 @@ except ImportError:
 # Surface import errors clearly in the Streamlit UI so deploy issues are
 # easy to diagnose, instead of "data leaks redacted" cryptic messages.
 try:
-    from pipeline.orchestrator import run_pipeline
+    from pipeline.orchestrator import run_pipeline, _fuzzy_match_metric
     from pipeline.export import to_excel
     from pipeline.ai_layer import verify, generate_insights, merged_flags
     from pipeline.models import METRICS
-    from extractors.company_registry import REGISTRY
+    from extractors.company_registry import REGISTRY, resolve as resolve_company
 except ModuleNotFoundError as e:
     st.set_page_config(page_title="Utility Benchmark — import error", page_icon="⚠️")
     st.error(f"**Import failed:** `{e.name}` could not be found.")
@@ -760,12 +760,49 @@ with st.sidebar:
     )
     if not has_known_key:
         st.caption("ℹ️ AI features are disabled — `ANTHROPIC_API_KEY` is not set.")
-    if custom_companies or custom_metrics:
-        if not use_ai:
-            st.warning(
-                "Custom companies/metrics need the AI fallback to find values. "
-                "Without it, they'll return null."
-            )
+
+    # Smarter per-entry feedback: classify each custom entry.
+    # - Custom company resolves via registry fuzzy match → no AI needed
+    # - Custom metric resolves via fuzzy match to a standard metric → no AI needed
+    # - Otherwise: AI fallback is required
+    custom_companies_needing_ai = []
+    custom_companies_resolved = []
+    for name in custom_companies:
+        if resolve_company(name):
+            custom_companies_resolved.append(name)
+        else:
+            custom_companies_needing_ai.append(name)
+
+    custom_metrics_needing_ai = []
+    custom_metrics_resolved = []  # list of (typed_name, matched_standard_metric)
+    for name in custom_metrics:
+        matched = _fuzzy_match_metric(name)
+        if matched:
+            custom_metrics_resolved.append((name, matched))
+        else:
+            custom_metrics_needing_ai.append(name)
+
+    # Show what resolved (good news first)
+    if custom_companies_resolved or custom_metrics_resolved:
+        msg_lines = []
+        for n in custom_companies_resolved:
+            msg_lines.append(f"• Company **{n}** → matched in registry, will use structured extractors")
+        for typed, matched in custom_metrics_resolved:
+            label = METRICS[matched]["label"]
+            msg_lines.append(f"• Metric **{typed}** → routed to **{label}** ({matched}), will use that metric's extractor")
+        st.success("These custom entries will work without AI:\n\n" + "\n\n".join(msg_lines))
+
+    # Show what genuinely needs AI
+    if (custom_companies_needing_ai or custom_metrics_needing_ai) and not use_ai:
+        msg_lines = []
+        for n in custom_companies_needing_ai:
+            msg_lines.append(f"• Company **{n}** — not in registry; needs AI fallback")
+        for n in custom_metrics_needing_ai:
+            msg_lines.append(f"• Metric **{n}** — no standard match; needs AI fallback")
+        st.warning(
+            "These entries need AI to find values, and AI is currently disabled. "
+            "They'll return null with that explanation:\n\n" + "\n\n".join(msg_lines)
+        )
 
     run_btn = st.button("Run benchmark", type="primary", use_container_width=True,
                         disabled=not (companies and metrics))
