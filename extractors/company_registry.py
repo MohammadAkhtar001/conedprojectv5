@@ -88,9 +88,15 @@ REGISTRY: dict[str, Company] = {
         # gives us US-jurisdiction revenue for the largest piece of the
         # business; smaller subs (Mass Electric, KeySpan, Narragansett) file
         # less consistently with SEC.
-        cik="0000071932",                       # Niagara Mohawk Power Corporation
+        # National Grid USA itself doesn't file 10-Ks (parent is UK-listed),
+        # and historically-filing US subs (Niagara Mohawk, KeySpan, Mass
+        # Electric) have ceased posting current XBRL data to SEC's
+        # companyfacts API.  We leave cik=None and let the AI fallback try
+        # to find revenue from National Grid's annual report or
+        # press release if ANTHROPIC_API_KEY is set.
+        cik=None,
         foundation_ein=None,                    # resolved by name lookup at runtime
-        foundation_name="National Grid USA Service Company",  # see notes
+        foundation_name="National Grid Foundation",
         eia_op_ids=(13501, 40209),              # Niagara Mohawk + Mass Electric
         egrid_operator_names=(),
         state_puc_codes=("NY-PSC", "MA-DPU", "RI-PUC"),
