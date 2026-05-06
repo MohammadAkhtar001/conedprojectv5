@@ -89,6 +89,16 @@ PHRASE_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"(\d{2,4})\s+grants\s+(?:paid|awarded|given)", "grants"),
         (r"(?:awarded|paid|gave)\s+(\d{2,4})\s+grants", "grants"),
     ],
+    "community_investment": [
+        (r"community\s+investment\D{0,80}?\$?([\d.,]+)\s*(million|m\b|billion|b\b)?", "$M"),
+        (r"invested\s+\$?([\d.,]+)\s*(million|m\b|billion|b\b)?\s+in\s+(?:our\s+)?communit", "$M"),
+        (r"corporate\s+(?:contributions|giving)\D{0,80}?\$?([\d.,]+)\s*(million|m\b)?", "$M"),
+    ],
+    "stem_education_giving": [
+        (r"(?:STEM|education)(?:\s+giving|\s+programs?|\s+grants?)?\D{0,80}?\$?([\d.,]+)\s*(million|m\b)?", "$M"),
+        (r"\$?([\d.,]+)\s*(million|m\b)?\s+(?:to|for|in)\s+(?:STEM|education|scholarship)", "$M"),
+        (r"scholarship\D{0,60}?\$?([\d.,]+)\s*(million|m\b)?", "$M"),
+    ],
 }
 
 
@@ -109,6 +119,8 @@ class CsrReportExtractor(Extractor):
         "volunteer_hours",
         "employee_match",
         "num_grants",
+        "community_investment",
+        "stem_education_giving",
     )
     source_name = "CSR / Sustainability Report"
     base_confidence = CONFIDENCE["csr_report"]
