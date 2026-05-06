@@ -86,7 +86,7 @@ except ImportError:
 try:
     from pipeline.orchestrator import run_pipeline
     from pipeline.export import to_excel
-    from pipeline.ai_layer import verify, generate_insights
+    from pipeline.ai_layer import verify, generate_insights, merged_flags
     from pipeline.models import METRICS
     from extractors.company_registry import REGISTRY
 except ModuleNotFoundError as e:
@@ -225,13 +225,22 @@ if run_btn:
 
     audit_text = None
     insights_text = None
+    flags = None
     if use_ai:
-        with st.spinner("AI verification…"):
+        with st.spinner("AI verification + quality scan…"):
             audit_text = verify(datapoints)
+            flags = merged_flags(datapoints)
         with st.spinner("Generating insights…"):
             insights_text = generate_insights(datapoints, audit_text)
+    else:
+        # Without AI we still apply the deterministic rule-based flags
+        # (low-confidence values and obvious peer-group outliers).
+        from pipeline.ai_layer import rule_based_flags
+        flags = rule_based_flags(datapoints)
+
     st.session_state["audit"] = audit_text
     st.session_state["insights"] = insights_text
+    st.session_state["flags"] = flags
 
     progress.success("Done.")
 
@@ -257,26 +266,59 @@ if "datapoints" in st.session_state:
     )
 
     with tab_table:
+        flags_map = st.session_state.get("flags") or {}
+
         st.subheader("Wide format (Companies × Metrics)")
+        st.caption(
+            "Flags: ✅ verified · ⚠️ caveat (low/medium confidence or partial coverage) "
+            "· 🚩 likely problem (no value, very low confidence, or peer outlier)"
+        )
         if df_long.empty:
             st.info("No data.")
         else:
-            metric_cols = []
+            metric_cols_present = [m for m in METRICS if m in df_long["metric"].unique()]
+            # Also include any custom (non-METRICS) metrics that came back
+            for m in df_long["metric"].unique():
+                if m not in METRICS and m not in metric_cols_present:
+                    metric_cols_present.append(m)
+
             wide = pd.DataFrame({"Company": sorted(df_long["company"].unique())})
-            for m in [m for m in METRICS if m in df_long["metric"].unique()]:
-                meta = METRICS[m]
-                col_name = f"{meta['label']} ({meta['unit']})"
-                metric_cols.append(col_name)
-                wide[col_name] = wide["Company"].map(
-                    lambda c: df_long[(df_long["company"] == c) & (df_long["metric"] == m)
-                                      & (df_long["ok"])]["value"].max()
-                )
+            for m in metric_cols_present:
+                meta = METRICS.get(m, {})
+                label = meta.get("label", m)
+                unit = meta.get("unit", "")
+                col_name = f"{label} ({unit})" if unit else label
+
+                def _cell(c, m=m):
+                    sub = df_long[(df_long["company"] == c) & (df_long["metric"] == m)]
+                    if sub.empty:
+                        return ""
+                    row = sub.iloc[0]
+                    flag_info = flags_map.get((c, m), {})
+                    flag = flag_info.get("flag", "")
+                    if not row["ok"]:
+                        return f"{flag} —"
+                    val = row["value"]
+                    return f"{flag} {val:g}" if isinstance(val, (int, float)) else f"{flag} {val}"
+
+                wide[col_name] = wide["Company"].map(_cell)
             st.dataframe(wide, use_container_width=True, hide_index=True)
 
-        st.subheader("Long format with sources & confidence")
+        st.subheader("Long format with flags, sources & confidence")
+        long_with_flags = df_long.copy()
+        long_with_flags["flag"] = long_with_flags.apply(
+            lambda r: flags_map.get((r["company"], r["metric"]), {}).get("flag", ""),
+            axis=1,
+        )
+        long_with_flags["flag_reason"] = long_with_flags.apply(
+            lambda r: flags_map.get((r["company"], r["metric"]), {}).get("reason", ""),
+            axis=1,
+        )
         st.dataframe(
-            df_long[["company", "metric_label", "value", "unit", "year",
-                     "confidence_score", "source_name", "source_url", "ok"]],
+            long_with_flags[
+                ["flag", "company", "metric_label", "value", "unit", "year",
+                 "confidence_score", "flag_reason", "source_name", "source_url", "ok"]
+            ],
             use_container_width=True,
             hide_index=True,
         )
