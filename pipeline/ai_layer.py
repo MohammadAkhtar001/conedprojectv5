@@ -143,74 +143,149 @@ Return a markdown bullet list. Use **bold** for headlines."""
 def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]:
     """Quick, deterministic flagging that runs without an API key.
 
-    Returns: {(company, metric): {"flag": "✅"|"⚠️"|"🚩", "reason": "..."}}
+    Returns: {(company, metric): {"flag": "✅"|"⚠️"|"🚩"|"ℹ️", "reason": "..."}}
+
+    Calibration philosophy: data from real government APIs and ProPublica is
+    almost always correct.  We avoid false-positive flags — a value at 0.50
+    confidence from J.D. Power or a CSR PDF is NOT a problem, it's a known
+    third-party source.  Only flag 🚩 when something is *wrong*, not just
+    "lower-tier".
 
     Rules:
-      🚩  no value (failed extraction)
-      🚩  confidence < 0.50  (third-party survey or worse)
-      🚩  value is a peer-group outlier (≥5× peer median, except for
-          structurally-explained metrics like carbon_emissions)
-      ⚠️  confidence 0.50–0.69 (CSR PDF, scraped sources)
-      ⚠️  value flagged as foundation-only when "total" was implied
-      ✅  confidence ≥ 0.70  AND  no other concerns
+      🚩  Genuine problems:
+          - peer outlier ≥10× the median (likely scale/unit error)
+          - confidence < 0.30 (press-release tier — we explicitly distrust)
+      ⚠️  Caveats worth knowing:
+          - foundation-only when "total" was requested
+          - confidence 0.30–0.49 AND value is also peer-outlier 3-10×
+      ℹ️  Failures by cause:
+          - no value, AI fallback was disabled
+          - no value, structural (e.g. company has no eGRID generation)
+          - no value, AI tried but failed (credit / API error)
+      ✅  Default for any successful value with confidence ≥ 0.50.
     """
     flags: dict[tuple[str, str], dict] = {}
 
-    # First pass: per-metric peer medians for outlier detection
+    # Peer medians for outlier detection
     peer_values: dict[str, list[float]] = {}
     for dp in datapoints:
-        if dp.ok and dp.value is not None:
+        if dp.ok and dp.value is not None and dp.value > 0:
             peer_values.setdefault(dp.metric, []).append(dp.value)
 
     for dp in datapoints:
         key = (dp.company, dp.metric)
 
+        # ── Failure cases — distinguish by cause ─────────────────────────────
         if not dp.ok:
-            flags[key] = {"flag": "🚩", "reason": "no value extracted"}
+            reason_text = ((dp.error or {}).get("reason") or "").lower()
+            notes_text = (dp.notes or "").lower()
+
+            if "ai fallback is disabled" in reason_text or "ai fallback is disabled" in notes_text:
+                flags[key] = {
+                    "flag": "ℹ️",
+                    "reason": ("custom metric — needs AI fallback (set "
+                               "ANTHROPIC_API_KEY in Streamlit secrets to enable)"),
+                }
+            elif "company is not an integrated generator" in reason_text:
+                flags[key] = {
+                    "flag": "ℹ️",
+                    "reason": ("not applicable — this company is a pure T&D "
+                               "distributor and has no eGRID-tracked generation"),
+                }
+            elif "no SEC CIK" in reason_text or "may not be SEC-registered" in reason_text:
+                flags[key] = {
+                    "flag": "ℹ️",
+                    "reason": ("no SEC 10-K filings on file (foreign parent / "
+                               "private subsidiary). Enable AI fallback to try "
+                               "annual report or news sources."),
+                }
+            elif "could not resolve foundation" in reason_text:
+                flags[key] = {
+                    "flag": "ℹ️",
+                    "reason": ("foundation not found on ProPublica — company may "
+                               "not have a registered 501(c)(3) corporate "
+                               "foundation, or the foundation uses a different name. "
+                               "Enable AI fallback for CSR-disclosed giving."),
+                }
+            elif "credit balance" in reason_text or "credit balance" in notes_text:
+                flags[key] = {
+                    "flag": "ℹ️",
+                    "reason": ("AI fallback could not run — Anthropic API credit "
+                               "is $0. Add billing at console.anthropic.com or "
+                               "remove ANTHROPIC_API_KEY from secrets."),
+                }
+            elif "ai fallback api call failed" in notes_text:
+                flags[key] = {
+                    "flag": "ℹ️",
+                    "reason": "AI fallback errored — see Attempts log for details",
+                }
+            else:
+                flags[key] = {
+                    "flag": "ℹ️",
+                    "reason": ((dp.error or {}).get("reason") or "no value extracted")[:200],
+                }
             continue
 
+        # ── Successful values: default to ✅, downgrade only when warranted ─
         c = dp.confidence_score or 0
         notes_lower = (dp.notes or "").lower()
 
-        if c < 0.50:
+        # Press-release tier — we distrust this enough to flag
+        if c < 0.30:
             flags[key] = {
                 "flag": "🚩",
-                "reason": f"low confidence ({c:.2f}) — third-party / scraped source",
+                "reason": f"very low confidence ({c:.2f}) — press release / news only",
             }
             continue
 
-        # Peer-outlier check (skip metrics where structural variance is normal)
-        if dp.metric not in ("carbon_emissions",):
+        # Peer-outlier check.  Skip metrics where structural variance is huge
+        # (carbon_emissions: integrated generator vs distributor; revenue:
+        # parent vs sub varies hugely).
+        outlier_skip = ("carbon_emissions", "revenue", "renewable_pct")
+        is_outlier = False
+        outlier_ratio = 0.0
+        outlier_median = 0.0
+        if dp.metric not in outlier_skip:
             peers = [v for v in peer_values.get(dp.metric, []) if v != dp.value]
-            if len(peers) >= 2:
+            if len(peers) >= 3:   # need at least 3 peers for stable median
                 peers.sort()
                 median = peers[len(peers) // 2]
                 if median > 0:
                     ratio = dp.value / median
-                    if ratio >= 5.0 or (0 < ratio <= 0.2):
-                        flags[key] = {
-                            "flag": "🚩",
-                            "reason": (f"peer outlier: {dp.value} is "
-                                       f"{ratio:.1f}× peer median ({median})"),
-                        }
-                        continue
+                    # Only flag truly extreme outliers (10×) — real philanthropy
+                    # at large utilities legitimately spans an order of magnitude
+                    if ratio >= 10.0 or (0 < ratio <= 0.1):
+                        is_outlier = True
+                        outlier_ratio = ratio
+                        outlier_median = median
+
+        if is_outlier and c < 0.50:
+            flags[key] = {
+                "flag": "🚩",
+                "reason": (f"extreme outlier: {dp.value} is {outlier_ratio:.1f}× "
+                           f"peer median ({outlier_median:g}) AND low confidence"),
+            }
+            continue
+
+        if is_outlier:
+            flags[key] = {
+                "flag": "⚠️",
+                "reason": (f"value is {outlier_ratio:.1f}× peer median "
+                           f"({outlier_median:g}) — verify it's the same scope/unit"),
+            }
+            continue
 
         # "Foundation only" caveat for charitable_giving
-        if dp.metric == "charitable_giving" and "foundation" in notes_lower:
+        if dp.metric == "charitable_giving" and "foundation" in notes_lower and "only" in notes_lower:
             flags[key] = {
                 "flag": "⚠️",
-                "reason": "foundation slice only — does not include direct corporate giving",
+                "reason": ("only the foundation 990-PF slice — does not include "
+                           "direct corporate giving, energy assistance, or in-kind"),
             }
             continue
 
-        if 0.50 <= c < 0.70:
-            flags[key] = {
-                "flag": "⚠️",
-                "reason": f"medium confidence ({c:.2f}) — CSR / non-regulator source",
-            }
-            continue
-
-        flags[key] = {"flag": "✅", "reason": f"confidence {c:.2f}, no concerns flagged"}
+        # Default: looks fine
+        flags[key] = {"flag": "✅", "reason": f"confidence {c:.2f}, no concerns"}
 
     return flags
 
