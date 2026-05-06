@@ -128,7 +128,7 @@ Output schema:
         attempts: list[ExtractionAttempt] = []
         try:
             msg = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-3-5-sonnet-20241022",
                 max_tokens=2000,
                 messages=[{"role": "user", "content": prompt}],
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
