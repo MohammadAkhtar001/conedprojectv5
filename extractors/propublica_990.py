@@ -43,7 +43,7 @@ _RESOLUTION_CACHE: dict[str, dict] = {}
 
 
 class ProPublica990Extractor(Extractor):
-    supplies_metrics = ("charitable_giving", "foundation_assets")
+    supplies_metrics = ("foundation_grants_paid", "charitable_giving", "foundation_assets")
     source_name = "ProPublica Nonprofit Explorer (IRS 990)"
     base_confidence = CONFIDENCE["propublica_990"]
 
@@ -155,6 +155,20 @@ class ProPublica990Extractor(Extractor):
                     notes=f"raw {m}={value} {unit} from {org_name} FY{year}",
                 ))
                 continue
+            note_text = f"From IRS Form 990 / 990-PF, fiscal year {year}"
+            confidence = self.base_confidence
+            if m == "charitable_giving":
+                # The 990-PF only captures the foundation's giving — it does
+                # NOT include direct corporate contributions, energy assistance
+                # spending, in-kind, etc.  So when a user asks for "Total
+                # Charitable Giving" we provide the foundation slice but flag
+                # that it's a lower bound, with reduced confidence.
+                note_text = (f"From IRS Form 990 / 990-PF FY{year}. "
+                             "NOTE: foundation grants paid only — does NOT include "
+                             "direct corporate contributions, energy assistance, "
+                             "or in-kind giving. For total giving, use the "
+                             "'community_investment' metric.")
+                confidence = max(0.50, self.base_confidence - 0.20)
             results.append(DataPoint(
                 company=company.name, metric=m,
                 value=round(validated, 3),
@@ -162,9 +176,9 @@ class ProPublica990Extractor(Extractor):
                 year=f"FY{year}" if year else None,
                 source_url=pp_ui_url,
                 source_name=f"{self.source_name} — {org_name} (EIN {ein_str})",
-                confidence_score=self.base_confidence,
+                confidence_score=confidence,
                 attempts=attempts,
-                notes=f"From IRS Form 990 / 990-PF, fiscal year {year}",
+                notes=note_text,
             ))
 
         return results
@@ -260,7 +274,7 @@ class ProPublica990Extractor(Extractor):
         """
         formtype = filing.get("formtype")
 
-        if metric == "charitable_giving":
+        if metric in ("charitable_giving", "foundation_grants_paid"):
             # Best-effort field probe across all known IRS element names for
             # contributions/grants paid.  Returns the first non-zero match.
             candidates = (
@@ -311,5 +325,6 @@ class ProPublica990Extractor(Extractor):
         return None
 
 
+register("foundation_grants_paid", ProPublica990Extractor)
 register("charitable_giving", ProPublica990Extractor)
 register("foundation_assets", ProPublica990Extractor)
