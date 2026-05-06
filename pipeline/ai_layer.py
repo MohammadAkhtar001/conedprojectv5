@@ -176,53 +176,92 @@ def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]
         key = (dp.company, dp.metric)
 
         # ── Failure cases — distinguish by cause ─────────────────────────────
+        # Flag philosophy:
+        #   ℹ️ = legitimate "not applicable" — the data doesn't exist for this
+        #        company×metric combo (pure distributor for carbon, no public
+        #        filings for a company that doesn't file).
+        #   🚩 = data exists somewhere but we failed to retrieve it (foundation
+        #        on ProPublica wasn't matched, custom metric needs CSR/AI to
+        #        find it).
+        #   AI suggestions are only added when AI would actually help.
         if not dp.ok:
             reason_text = ((dp.error or {}).get("reason") or "").lower()
             notes_text = (dp.notes or "").lower()
 
-            if "ai fallback is disabled" in reason_text or "ai fallback is disabled" in notes_text:
+            if "company is not an integrated generator" in reason_text:
+                # Pure distributor + carbon emissions: this is a structural
+                # mismatch, not an extraction failure.  No AI can fix this.
                 flags[key] = {
                     "flag": "ℹ️",
-                    "reason": ("custom metric — needs AI fallback (set "
-                               "ANTHROPIC_API_KEY in Streamlit secrets to enable)"),
-                }
-            elif "company is not an integrated generator" in reason_text:
-                flags[key] = {
-                    "flag": "ℹ️",
-                    "reason": ("not applicable — this company is a pure T&D "
-                               "distributor and has no eGRID-tracked generation"),
+                    "reason": ("Not applicable — this company is a pure "
+                               "transmission/distribution utility and does NOT own "
+                               "generation plants tracked in EPA eGRID. Their Scope 1 "
+                               "emissions are negligible and reported only in their "
+                               "CSR report (vehicle fleet, gas leaks)."),
                 }
             elif "no SEC CIK" in reason_text or "may not be SEC-registered" in reason_text:
+                # Could be UK parent (NG) or non-investor-owned (PSEG LI is a
+                # LIPA contractor, not a separate SEC filer).  AI MIGHT find
+                # revenue from annual reports or news.
                 flags[key] = {
-                    "flag": "ℹ️",
-                    "reason": ("no SEC 10-K filings on file (foreign parent / "
-                               "private subsidiary). Enable AI fallback to try "
-                               "annual report or news sources."),
+                    "flag": "🚩",
+                    "reason": ("No SEC 10-K filings — company may have a foreign "
+                               "parent, be a privately-held subsidiary, or be a "
+                               "non-IOU public entity. Revenue likely available "
+                               "from annual report or parent's filing; enable "
+                               "AI fallback to try those sources."),
                 }
             elif "could not resolve foundation" in reason_text:
+                # Foundation might exist under a different name, OR the
+                # company might not have a registered 501(c)(3) foundation
+                # at all (giving via direct corporate budget instead).
                 flags[key] = {
-                    "flag": "ℹ️",
-                    "reason": ("foundation not found on ProPublica — company may "
-                               "not have a registered 501(c)(3) corporate "
-                               "foundation, or the foundation uses a different name. "
-                               "Enable AI fallback for CSR-disclosed giving."),
+                    "flag": "🚩",
+                    "reason": ("Foundation not found on ProPublica. Either the "
+                               "company has no 501(c)(3) corporate foundation "
+                               "(gives directly from operating budget — common for "
+                               "smaller utilities), or the foundation uses a "
+                               "different legal name. AI fallback can search CSR "
+                               "reports and press releases for this."),
+                }
+            elif ("ai fallback is disabled" in reason_text or
+                  "could not be auto-matched" in reason_text or
+                  "matched to" in reason_text):
+                # Custom metric situation
+                flags[key] = {
+                    "flag": "🚩",
+                    "reason": ("Custom metric — value likely exists in a CSR/"
+                               "sustainability report or company news but no "
+                               "automated extractor could find it. AI fallback "
+                               "(Anthropic API key) would search the web for it."),
                 }
             elif "credit balance" in reason_text or "credit balance" in notes_text:
                 flags[key] = {
-                    "flag": "ℹ️",
-                    "reason": ("AI fallback could not run — Anthropic API credit "
-                               "is $0. Add billing at console.anthropic.com or "
-                               "remove ANTHROPIC_API_KEY from secrets."),
+                    "flag": "🚩",
+                    "reason": ("AI fallback failed — Anthropic API credit is $0. "
+                               "Add billing at console.anthropic.com to enable, "
+                               "or remove ANTHROPIC_API_KEY from secrets."),
+                }
+            elif "csr_url" in notes_text or "no csr url on file" in notes_text:
+                # CSR URL not in the registry — would need manual config OR AI
+                flags[key] = {
+                    "flag": "🚩",
+                    "reason": ("No CSR report URL configured for this company. "
+                               "Add one to extractors/csr_report.py CSR_URL_HINTS, "
+                               "or enable AI fallback to find values via web search."),
                 }
             elif "ai fallback api call failed" in notes_text:
                 flags[key] = {
-                    "flag": "ℹ️",
-                    "reason": "AI fallback errored — see Attempts log for details",
+                    "flag": "🚩",
+                    "reason": "AI fallback errored — see Attempts log for the API error",
                 }
             else:
+                # Generic failure — the structured extractor was tried and
+                # came back empty. Probably retrievable with a different
+                # source or AI fallback.
                 flags[key] = {
-                    "flag": "ℹ️",
-                    "reason": ((dp.error or {}).get("reason") or "no value extracted")[:200],
+                    "flag": "🚩",
+                    "reason": ((dp.error or {}).get("reason") or "no value extracted")[:240],
                 }
             continue
 
