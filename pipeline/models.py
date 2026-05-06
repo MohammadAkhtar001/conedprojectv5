@@ -71,9 +71,13 @@ METRICS: dict[str, dict[str, Any]] = {
         "unit": "$M",
         "category": "philanthropy",
         "lower_is_better": False,
-        "plausible_min": 0.5,
+        # Lowered floor from 0.5 to 0.01: utility foundations sometimes have
+        # off-years where grants paid drop well below $500k (e.g. asset
+        # rebalancing, distribution timing).  $10k floor is still high enough
+        # to catch obvious zero / typo values.
+        "plausible_min": 0.01,
         "plausible_max": 200.0,
-        "expected_range": "$5M – $50M for large US utilities",
+        "expected_range": "$5M – $50M for large US utilities (smaller in off-years)",
         "description": "Total cash giving (foundation grants paid + corporate contributions).",
     },
     "foundation_assets": {
