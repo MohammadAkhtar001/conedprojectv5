@@ -1,16 +1,17 @@
 """
-Export utilities — CSV and Excel.
+Excel + CSV export.
 
-The Excel workbook is the artifact a Community Partnerships analyst can
-hand off:
-  - "Summary"          run metadata, coverage, source mix
-  - "Benchmark"        wide companies × metrics matrix, formatted
-  - "Detailed"         long format with flags, values, sources, confidence
-  - "Failures & Notes" pairs that returned null, with reasons
-  - "AI Audit"         AI verification + insights (when AI ran)
-  - "Attempts log"     full HTTP audit trail (collapsed/hidden by default)
+The Excel workbook is the artifact a Community Partnerships analyst hands to
+their VP.  It needs to look professional and be navigable without the analyst
+having to explain every column.
 
-CSV is the long-format equivalent of "Detailed".
+Sheets:
+  - Cover            single-page brief: companies, metrics, coverage, top insights
+  - Benchmark        wide table — companies × metrics, formatted values
+  - Per metric       one block per metric: clear label, every company, source
+  - Failures & gaps  null cells with plain-English explanations
+  - AI Audit         AI-generated audit + insights, formatted for reading
+  - Attempts log     full HTTP audit trail (hidden by default)
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import pandas as pd
 from .models import DataPoint, METRICS
 
 
-# ── Excel-safe sanitization ─────────────────────────────────────────────────
+# ── Excel-safe sanitization ────────────────────────────────────────────────
 _ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
@@ -49,7 +50,7 @@ def _sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ── CSV ─────────────────────────────────────────────────────────────────────
+# ── CSV ────────────────────────────────────────────────────────────────────
 
 
 def to_dataframe(datapoints: Iterable[DataPoint]) -> pd.DataFrame:
@@ -63,67 +64,99 @@ def to_csv(datapoints: Iterable[DataPoint], path: str | Path) -> Path:
     return path
 
 
-# ── Excel ───────────────────────────────────────────────────────────────────
+# ── Styling palette ─────────────────────────────────────────────────────────
+# Used consistently across every sheet for a polished look.
+
+PALETTE = {
+    "primary":      "1F4E79",   # Con Edison-ish dark blue (header bar)
+    "primary_text": "FFFFFF",
+    "accent":       "2E75B6",
+    "subtle":       "F2F6FA",   # zebra stripe (very light blue)
+    "border":       "BFBFBF",
+    "good":         "C6EFCE",
+    "good_text":    "006100",
+    "warn":         "FFEB9C",
+    "warn_text":    "9C5700",
+    "bad":          "FFC7CE",
+    "bad_text":     "9C0006",
+    "info":         "DDEBF7",
+    "muted":        "808080",
+}
 
 
-def _apply_formatting(ws, *, title: str, freeze_at: str = "A2",
-                      col_widths: Optional[dict] = None,
-                      number_format_cols: Optional[dict] = None):
-    """Apply consistent formatting: header style, frozen panes, column widths,
-    number formatting, autofilter."""
+def _styles():
+    """Pre-built openpyxl style objects (computed once at import)."""
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
 
-    # Header row styling
-    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    header_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    thin = Side(border_style="thin", color="BBBBBB")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    thin = Side(border_style="thin", color=PALETTE["border"])
+    return {
+        "border":         Border(left=thin, right=thin, top=thin, bottom=thin),
+        "header_fill":    PatternFill(start_color=PALETTE["primary"],
+                                      end_color=PALETTE["primary"],
+                                      fill_type="solid"),
+        "header_font":    Font(name="Calibri", size=11, bold=True,
+                               color=PALETTE["primary_text"]),
+        "header_align":   Alignment(horizontal="left", vertical="center",
+                                    wrap_text=True),
+        "title_font":     Font(name="Calibri", size=18, bold=True,
+                               color=PALETTE["primary"]),
+        "subtitle_font":  Font(name="Calibri", size=11, italic=True,
+                               color=PALETTE["muted"]),
+        "section_font":   Font(name="Calibri", size=13, bold=True,
+                               color=PALETTE["primary"]),
+        "label_font":     Font(name="Calibri", size=10, bold=True),
+        "body_font":      Font(name="Calibri", size=10),
+        "body_align":     Alignment(vertical="top", wrap_text=True),
+        "zebra_fill":     PatternFill(start_color=PALETTE["subtle"],
+                                      end_color=PALETTE["subtle"],
+                                      fill_type="solid"),
+        "good_fill":      PatternFill(start_color=PALETTE["good"],
+                                      end_color=PALETTE["good"],
+                                      fill_type="solid"),
+        "warn_fill":      PatternFill(start_color=PALETTE["warn"],
+                                      end_color=PALETTE["warn"],
+                                      fill_type="solid"),
+        "bad_fill":       PatternFill(start_color=PALETTE["bad"],
+                                      end_color=PALETTE["bad"],
+                                      fill_type="solid"),
+        "info_fill":      PatternFill(start_color=PALETTE["info"],
+                                      end_color=PALETTE["info"],
+                                      fill_type="solid"),
+    }
 
-    if ws.max_row >= 1:
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_align
-            cell.border = border
 
-    # Body rows: light borders, wrap text
-    body_align = Alignment(vertical="top", wrap_text=True)
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for cell in row:
-            cell.alignment = body_align
-            cell.border = border
+# ── Per-metric formatting ──────────────────────────────────────────────────
 
-    # Header row height
-    if ws.max_row >= 1:
-        ws.row_dimensions[1].height = 32
 
-    # Column widths
-    if col_widths:
-        for col_name, width in col_widths.items():
-            # Find the column letter for this header
-            for cell in ws[1]:
-                if str(cell.value).strip() == col_name:
-                    ws.column_dimensions[get_column_letter(cell.column)].width = width
-                    break
+def _number_format_for(unit: str) -> str:
+    """Excel format string for a given unit."""
+    return {
+        "$B":         '"$"#,##0.00"B"',
+        "$M":         '"$"#,##0.00"M"',
+        "%":          "0.0%",
+        "/100":       "0.0",
+        "M MT CO2":   "0.00",
+        "min/yr":     "#,##0",
+        "hrs/yr":     "#,##0",
+        "grants":     "#,##0",
+    }.get(unit, "#,##0.00")
 
-    # Number formats
-    if number_format_cols:
-        for col_name, fmt in number_format_cols.items():
-            for cell in ws[1]:
-                if str(cell.value).strip() == col_name:
-                    col_letter = get_column_letter(cell.column)
-                    for r in range(2, ws.max_row + 1):
-                        ws[f"{col_letter}{r}"].number_format = fmt
-                    break
 
-    # Freeze top row, enable autofilter
-    ws.freeze_panes = freeze_at
-    if ws.max_row > 1 and ws.max_column > 0:
-        from openpyxl.utils import get_column_letter as _gc
-        last_col = _gc(ws.max_column)
-        ws.auto_filter.ref = f"A1:{last_col}{ws.max_row}"
+def _value_for_excel(value, unit: str):
+    """Adjust value to match the unit's expected display.  E.g. % is stored
+    as a fraction (0.42 not 42) so '%' format prints '42.0%' correctly."""
+    if value is None:
+        return None
+    if unit == "%":
+        # If the value is already 0–1, leave it; if 0–100, divide
+        try:
+            return float(value) / 100 if float(value) > 1 else float(value)
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
+# ── Excel writer ───────────────────────────────────────────────────────────
 
 
 def to_excel(
@@ -135,227 +168,543 @@ def to_excel(
     audit_summary: str | None = None,
     flags: dict | None = None,
 ) -> Path:
-    """Write a multi-sheet workbook formatted for analyst hand-off."""
-    from openpyxl.styles import Alignment, Font, PatternFill
+    """Write a polished multi-sheet workbook for analyst hand-off."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
     from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.dimensions import ColumnDimension
 
     path = Path(path)
     flags = flags or {}
+    s = _styles()
 
     companies = sorted({dp.company for dp in datapoints})
-    metrics_in_run = []
-    seen = set()
-    # Preserve user's metric order: standard metrics first (in METRICS order),
-    # then any custom metrics in alphabetical order
-    for m in METRICS:
-        if any(dp.metric == m for dp in datapoints) and m not in seen:
-            metrics_in_run.append(m)
-            seen.add(m)
-    custom_metrics = sorted({dp.metric for dp in datapoints if dp.metric not in seen})
-    metrics_in_run.extend(custom_metrics)
+    metric_keys_seen: list[str] = []
+    for dp in datapoints:
+        if dp.metric not in metric_keys_seen:
+            metric_keys_seen.append(dp.metric)
+    # Prefer the canonical METRICS order, then any custom metrics
+    ordered_metrics = [m for m in METRICS if m in metric_keys_seen]
+    custom = [m for m in metric_keys_seen if m not in METRICS]
+    ordered_metrics.extend(sorted(custom))
 
     ok_dps = [dp for dp in datapoints if dp.ok]
     fail_dps = [dp for dp in datapoints if not dp.ok]
-    confidences = [dp.confidence_score for dp in ok_dps if dp.confidence_score is not None]
-    avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
 
-    source_mix: dict[str, int] = defaultdict(int)
+    wb = Workbook()
+    # Remove the default sheet — we'll create our own
+    wb.remove(wb.active)
+
+    # ── Sheet 1: Cover ─────────────────────────────────────────────────────
+    cover = wb.create_sheet("Cover")
+    _write_cover_sheet(cover, datapoints, ok_dps, fail_dps, companies,
+                       ordered_metrics, audit_summary, insights, s)
+
+    # ── Sheet 2: Benchmark (wide, formatted) ───────────────────────────────
+    bench = wb.create_sheet("Benchmark")
+    _write_benchmark_sheet(bench, datapoints, companies, ordered_metrics, flags, s)
+
+    # ── Sheet 3: Per metric (one labeled block per metric) ─────────────────
+    per_metric = wb.create_sheet("Per metric")
+    _write_per_metric_sheet(per_metric, datapoints, companies, ordered_metrics, flags, s)
+
+    # ── Sheet 4: Failures & gaps ───────────────────────────────────────────
+    if fail_dps:
+        fails = wb.create_sheet("Failures & gaps")
+        _write_failures_sheet(fails, fail_dps, flags, s)
+
+    # ── Sheet 5: AI Audit ─────────────────────────────────────────────────
+    if audit_summary or insights:
+        audit = wb.create_sheet("AI Audit")
+        _write_audit_sheet(audit, audit_summary, insights, s)
+
+    # ── Sheet 6: Attempts log (hidden) ─────────────────────────────────────
+    attempt_rows = []
+    for dp in datapoints:
+        for a in dp.attempts:
+            attempt_rows.append({
+                "Company": dp.company,
+                "Metric": dp.metric,
+                "Source": a.source,
+                "URL": a.url,
+                "Method": a.method,
+                "Status": a.status_code,
+                "OK": a.success,
+                "Time (ms)": a.duration_ms,
+                "Error": a.error,
+                "Preview": (a.response_preview or "")[:240],
+            })
+    if attempt_rows:
+        att = wb.create_sheet("Attempts log")
+        _write_attempts_sheet(att, attempt_rows, s)
+        att.sheet_state = "hidden"
+
+    wb.save(path)
+    return path
+
+
+# ── Sheet writers ──────────────────────────────────────────────────────────
+
+
+def _write_cover_sheet(ws, datapoints, ok_dps, fail_dps, companies,
+                       ordered_metrics, audit_summary, insights, s):
+    """One-page executive brief."""
+    from openpyxl.utils import get_column_letter
+
+    confidences = [dp.confidence_score for dp in ok_dps if dp.confidence_score]
+    avg_conf = sum(confidences) / max(1, len(confidences))
+
+    # Title
+    ws["A1"] = "Utility Benchmark — Run Summary"
+    ws["A1"].font = s["title_font"]
+    ws.row_dimensions[1].height = 30
+
+    ws["A2"] = f"Compiled {datetime.utcnow().strftime('%B %d, %Y · %H:%M UTC')}"
+    ws["A2"].font = s["subtitle_font"]
+
+    ws.row_dimensions[3].height = 10  # spacer
+
+    row = 4
+    def _section(text):
+        nonlocal row
+        ws.cell(row=row, column=1, value=text).font = s["section_font"]
+        row += 1
+
+    def _kv(label, value):
+        nonlocal row
+        c1 = ws.cell(row=row, column=1, value=_sanitize_for_excel(label))
+        c1.font = s["label_font"]
+        c1.alignment = s["body_align"]
+        c2 = ws.cell(row=row, column=2, value=_sanitize_for_excel(str(value)))
+        c2.font = s["body_font"]
+        c2.alignment = s["body_align"]
+        row += 1
+
+    _section("Scope")
+    _kv("Companies", f"{len(companies)} — {', '.join(companies)}")
+    _kv("Metrics", f"{len(ordered_metrics)} — " +
+        ", ".join(METRICS.get(m, {}).get("label", m) for m in ordered_metrics))
+    row += 1
+
+    _section("Coverage")
+    _kv("Total (company × metric) pairs", len(datapoints))
+    _kv("Successful extractions", f"{len(ok_dps)} ({len(ok_dps)/max(1,len(datapoints))*100:.0f}%)")
+    _kv("Null (with reason)", len(fail_dps))
+    _kv("Average confidence (when value present)", f"{avg_conf:.2f}")
+    row += 1
+
+    _section("Confidence breakdown")
+    for threshold, label in [(0.90, "Government API exact (≥ 0.90)"),
+                              (0.75, "ProPublica 990 / derived (≥ 0.75)"),
+                              (0.60, "CSR PDF (≥ 0.60)"),
+                              (0.50, "Third-party survey (≥ 0.50)")]:
+        n = sum(1 for c in confidences if c >= threshold)
+        _kv(label, n)
+    row += 1
+
+    _section("Source mix (successful values only)")
+    source_count: dict[str, int] = defaultdict(int)
     for dp in ok_dps:
         key = (dp.source_name or "unknown").split(" — ")[0]
-        source_mix[key] += 1
+        source_count[key] += 1
+    for src, n in sorted(source_count.items(), key=lambda x: -x[1]):
+        _kv(src, n)
+    row += 1
 
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        # ── Sheet 1: Summary ───────────────────────────────────────────────
-        summary_rows = [
-            ["Utility Benchmark Pipeline — Run Summary", ""],
-            [f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", ""],
-            ["", ""],
-            ["Companies", ", ".join(companies)],
-            ["Metrics", ", ".join(METRICS.get(m, {}).get("label", m) for m in metrics_in_run)],
-            ["", ""],
-            ["── Coverage ──", ""],
-            ["Total (company × metric) pairs", len(datapoints)],
-            ["Successful extractions", len(ok_dps)],
-            ["Failed extractions (null)", len(fail_dps)],
-            ["Coverage", f"{(len(ok_dps) / max(1, len(datapoints))) * 100:.1f}%"],
-            ["", ""],
-            ["── Confidence ──", ""],
-            ["Average confidence (successful values)", round(avg_conf, 3)],
+    if audit_summary:
+        _section("Data quality audit (excerpt)")
+        # Show first ~6 lines
+        excerpt = "\n".join((audit_summary or "").split("\n")[:8])
+        c = ws.cell(row=row, column=1, value=_sanitize_for_excel(excerpt))
+        c.alignment = s["body_align"]
+        c.font = s["body_font"]
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        ws.row_dimensions[row].height = 100
+        row += 1
+        ws.cell(row=row, column=1, value="(Full audit on the 'AI Audit' sheet.)").font = s["subtitle_font"]
+        row += 2
+
+    # Column widths
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 80
+
+    # Hide gridlines for a cleaner look
+    ws.sheet_view.showGridLines = False
+
+
+def _write_benchmark_sheet(ws, datapoints, companies, ordered_metrics, flags, s):
+    """Wide companies × metrics table, cleanly formatted."""
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Alignment
+
+    # Title
+    ws["A1"] = "Benchmark — Companies × Metrics"
+    ws["A1"].font = s["title_font"]
+    ws.row_dimensions[1].height = 28
+    ws.merge_cells(start_row=1, start_column=1,
+                   end_row=1, end_column=1 + len(ordered_metrics) + 1)
+
+    ws["A2"] = (
+        "Each cell shows the value with a flag emoji.  ✅ verified · "
+        "⚠️ caveat · 🚩 data exists but couldn't be retrieved · "
+        "ℹ️ not applicable · — null"
+    )
+    ws["A2"].font = s["subtitle_font"]
+    ws.row_dimensions[2].height = 20
+    ws.merge_cells(start_row=2, start_column=1,
+                   end_row=2, end_column=1 + len(ordered_metrics) + 1)
+
+    # Header row at row 4
+    header_row = 4
+    headers = ["Company"] + [
+        f"{METRICS.get(m, {}).get('label', m)}\n({METRICS.get(m, {}).get('unit', '')})"
+        for m in ordered_metrics
+    ] + ["Flags summary"]
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=header_row, column=col_idx, value=_sanitize_for_excel(h))
+        cell.fill = s["header_fill"]
+        cell.font = s["header_font"]
+        cell.alignment = s["header_align"]
+        cell.border = s["border"]
+    ws.row_dimensions[header_row].height = 36
+
+    # Body rows
+    for r_offset, company in enumerate(companies):
+        excel_row = header_row + 1 + r_offset
+        # Company name cell
+        c = ws.cell(row=excel_row, column=1, value=_sanitize_for_excel(company))
+        c.font = s["label_font"]
+        c.alignment = s["body_align"]
+        c.border = s["border"]
+
+        flag_summary: dict[str, int] = defaultdict(int)
+        for col_idx, metric in enumerate(ordered_metrics, 2):
+            dp = next((d for d in datapoints if d.company == company and d.metric == metric), None)
+            flag_info = flags.get((company, metric), {})
+            flag = flag_info.get("flag", "")
+            cell = ws.cell(row=excel_row, column=col_idx)
+            unit = METRICS.get(metric, {}).get("unit", "")
+
+            if dp and dp.ok:
+                # Real number: store as number, format via number_format
+                cell.value = _value_for_excel(dp.value, unit)
+                cell.number_format = _number_format_for(unit)
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+                # Set flag in a comment so the cell stays a number
+                from openpyxl.comments import Comment
+                if flag:
+                    flag_text = (flag_info.get("reason") or "")[:200]
+                    cell.comment = Comment(f"{flag}  {flag_text}", "Pipeline")
+            else:
+                # Null cell: show flag + em-dash
+                cell.value = f"{flag} —"
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.font = s["body_font"]
+
+            cell.border = s["border"]
+            if flag:
+                flag_summary[flag] += 1
+            # Zebra striping
+            if r_offset % 2 == 1 and not (dp and dp.ok):
+                cell.fill = s["zebra_fill"]
+            elif r_offset % 2 == 1:
+                cell.fill = s["zebra_fill"]
+
+        # Flags summary column
+        summary_str = "  ".join(f"{flag}{n}" for flag, n in sorted(flag_summary.items()))
+        last_cell = ws.cell(row=excel_row, column=len(headers), value=summary_str)
+        last_cell.alignment = Alignment(horizontal="left", vertical="center")
+        last_cell.border = s["border"]
+        last_cell.font = s["body_font"]
+        if r_offset % 2 == 1:
+            last_cell.fill = s["zebra_fill"]
+
+    # Column widths
+    ws.column_dimensions["A"].width = 28
+    for col_idx in range(2, len(ordered_metrics) + 2):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 18
+    ws.column_dimensions[get_column_letter(len(headers))].width = 20
+
+    # Freeze panes at top-left of data
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=2).coordinate
+
+    # Autofilter
+    last_col = get_column_letter(len(headers))
+    last_row = header_row + len(companies)
+    ws.auto_filter.ref = f"A{header_row}:{last_col}{last_row}"
+
+    ws.sheet_view.showGridLines = False
+
+
+def _write_per_metric_sheet(ws, datapoints, companies, ordered_metrics, flags, s):
+    """One labeled block per metric, with each company's value clearly tied to it."""
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Alignment
+
+    ws["A1"] = "Per metric — companies and values"
+    ws["A1"].font = s["title_font"]
+    ws.row_dimensions[1].height = 28
+
+    ws["A2"] = ("One block per metric. Each company is on its own row inside "
+                "the block, so you can see exactly which value belongs to which company.")
+    ws["A2"].font = s["subtitle_font"]
+    ws.row_dimensions[2].height = 18
+
+    row = 4
+    for metric in ordered_metrics:
+        meta = METRICS.get(metric, {})
+        label = meta.get("label", metric)
+        unit = meta.get("unit", "")
+        description = meta.get("description", "(custom metric)")
+        expected = meta.get("expected_range", "n/a")
+        lower_better = meta.get("lower_is_better", False)
+
+        # Section header
+        section_title = f"{label}" + (f"  ·  {unit}" if unit else "")
+        cell = ws.cell(row=row, column=1, value=section_title)
+        cell.font = s["section_font"]
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        # Description line
+        c = ws.cell(row=row, column=1,
+                    value=f"{description} · expected {expected} · "
+                          f"{'lower is better' if lower_better else 'higher is better'}")
+        c.font = s["subtitle_font"]
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        row += 1
+
+        # Column headers for this block
+        headers = ["Flag", "Company", "Value", "Unit", "Year", "Source"]
+        for col_idx, h in enumerate(headers, 1):
+            hc = ws.cell(row=row, column=col_idx, value=h)
+            hc.fill = s["header_fill"]
+            hc.font = s["header_font"]
+            hc.alignment = s["header_align"]
+            hc.border = s["border"]
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        # Sort companies by value (high→low or low→high based on lower_is_better),
+        # nulls at bottom
+        rows_data = []
+        for company in companies:
+            dp = next((d for d in datapoints if d.company == company and d.metric == metric), None)
+            flag_info = flags.get((company, metric), {})
+            rows_data.append((company, dp, flag_info))
+
+        def sort_key(t):
+            _, dp, _ = t
+            if dp and dp.ok:
+                return (0, -dp.value if not lower_better else dp.value)
+            return (1, 0)
+        rows_data.sort(key=sort_key)
+
+        for r_offset, (company, dp, flag_info) in enumerate(rows_data):
+            flag = flag_info.get("flag", "")
+            zebra = (r_offset % 2 == 1)
+
+            cells = []
+            # Flag
+            c = ws.cell(row=row, column=1, value=flag)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            cells.append(c)
+            # Company
+            c = ws.cell(row=row, column=2, value=_sanitize_for_excel(company))
+            c.font = s["label_font"]
+            cells.append(c)
+            # Value
+            if dp and dp.ok:
+                vc = ws.cell(row=row, column=3, value=_value_for_excel(dp.value, unit))
+                vc.number_format = _number_format_for(unit)
+                vc.alignment = Alignment(horizontal="right", vertical="center")
+            else:
+                # Show "—" with flag-colored fill so failures are scannable
+                vc = ws.cell(row=row, column=3, value="—")
+                vc.alignment = Alignment(horizontal="right", vertical="center")
+                if flag == "🚩":
+                    vc.fill = s["bad_fill"]
+                elif flag == "ℹ️":
+                    vc.fill = s["info_fill"]
+            cells.append(vc)
+            # Unit
+            c = ws.cell(row=row, column=4, value=unit)
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            cells.append(c)
+            # Year
+            c = ws.cell(row=row, column=5, value=_sanitize_for_excel(dp.year if dp and dp.ok else "—"))
+            cells.append(c)
+            # Source (or reason for failure)
+            if dp and dp.ok:
+                source_text = (dp.source_name or "").split(" — ")[0]
+            else:
+                source_text = (flag_info.get("reason") or "(see Failures sheet)")[:200]
+            c = ws.cell(row=row, column=6, value=_sanitize_for_excel(source_text))
+            c.alignment = s["body_align"]
+            cells.append(c)
+
+            # Apply zebra striping + borders + body font
+            for cc in cells:
+                cc.border = s["border"]
+                if cc.font is None or cc.font.bold is False:
+                    cc.font = s["body_font"]
+                if zebra and cc.fill.start_color.rgb in (None, "00000000"):
+                    cc.fill = s["zebra_fill"]
+            row += 1
+
+        row += 1  # spacer between metrics
+
+    # Column widths
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 28
+    ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 12
+    ws.column_dimensions["E"].width = 12
+    ws.column_dimensions["F"].width = 60
+
+    ws.sheet_view.showGridLines = False
+
+
+def _write_failures_sheet(ws, fail_dps, flags, s):
+    """Dedicated failures sheet with 'what this means' plain-English column."""
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Alignment
+
+    ws["A1"] = "Failures & gaps"
+    ws["A1"].font = s["title_font"]
+    ws.row_dimensions[1].height = 28
+
+    ws["A2"] = ("These are honest reports of what couldn't be retrieved.  "
+                "Some are legitimate (ℹ️) — the data doesn't exist for that combination.  "
+                "Others (🚩) are likely retrievable manually — see 'What this means' for guidance.")
+    ws["A2"].font = s["subtitle_font"]
+    ws.row_dimensions[2].height = 32
+    ws.merge_cells("A2:F2")
+
+    headers = ["Flag", "Company", "Metric", "What this means (plain English)",
+               "Technical reason", "Sources tried"]
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=4, column=col_idx, value=h)
+        cell.fill = s["header_fill"]
+        cell.font = s["header_font"]
+        cell.alignment = s["header_align"]
+        cell.border = s["border"]
+    ws.row_dimensions[4].height = 28
+
+    for r_offset, dp in enumerate(fail_dps):
+        excel_row = 5 + r_offset
+        flag_info = flags.get((dp.company, dp.metric), {})
+        flag = flag_info.get("flag", "🚩")
+        meta = METRICS.get(dp.metric, {})
+
+        cells = [
+            ws.cell(row=excel_row, column=1, value=flag),
+            ws.cell(row=excel_row, column=2, value=_sanitize_for_excel(dp.company)),
+            ws.cell(row=excel_row, column=3, value=_sanitize_for_excel(meta.get("label", dp.metric))),
+            ws.cell(row=excel_row, column=4, value=_sanitize_for_excel(flag_info.get("reason", "")[:500])),
+            ws.cell(row=excel_row, column=5, value=_sanitize_for_excel((dp.error or {}).get("reason", "")[:500])),
+            ws.cell(row=excel_row, column=6, value=_sanitize_for_excel(", ".join((dp.error or {}).get("attempted_sources", []))[:200])),
         ]
-        for threshold, label in [(0.90, "Government API exact (≥ 0.90)"),
-                                 (0.75, "ProPublica 990 / derived (≥ 0.75)"),
-                                 (0.60, "CSR PDF (≥ 0.60)"),
-                                 (0.50, "Third-party survey (≥ 0.50)")]:
-            n = sum(1 for c in confidences if c >= threshold)
-            summary_rows.append([label, n])
-        summary_rows.append(["", ""])
-        summary_rows.append(["── Source mix ──", ""])
-        for src, n in sorted(source_mix.items(), key=lambda x: -x[1]):
-            summary_rows.append([src, n])
+        for c in cells:
+            c.border = s["border"]
+            c.alignment = s["body_align"]
+            c.font = s["body_font"]
+        # Color-code the row by flag
+        if flag == "ℹ️":
+            for c in cells:
+                c.fill = s["info_fill"]
+        elif flag == "🚩":
+            for c in cells:
+                c.fill = s["bad_fill"]
 
-        sanitized_summary = [[_sanitize_for_excel(c) for c in r] for r in summary_rows]
-        df_summary = pd.DataFrame(sanitized_summary, columns=["Metric", "Value"])
-        df_summary.to_excel(writer, sheet_name="Summary", index=False, header=False)
+    # Column widths
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 28
+    ws.column_dimensions["D"].width = 60
+    ws.column_dimensions["E"].width = 50
+    ws.column_dimensions["F"].width = 35
 
-        # Style summary
-        ws = writer.sheets["Summary"]
-        ws.column_dimensions["A"].width = 45
-        ws.column_dimensions["B"].width = 60
-        title_font = Font(name="Calibri", size=14, bold=True, color="1F4E79")
-        section_font = Font(name="Calibri", size=11, bold=True, color="1F4E79")
-        ws["A1"].font = title_font
-        for r in range(1, ws.max_row + 1):
-            v = ws.cell(row=r, column=1).value
-            if v and isinstance(v, str) and v.startswith("──"):
-                ws.cell(row=r, column=1).font = section_font
+    ws.freeze_panes = "A5"
+    ws.sheet_view.showGridLines = False
 
-        # ── Sheet 2: Benchmark (wide, formatted) ───────────────────────────
-        wide_rows = []
-        for c in companies:
-            row = {"Company": c}
-            for m in metrics_in_run:
-                meta = METRICS.get(m, {})
-                label = meta.get("label", m)
-                unit = meta.get("unit", "")
-                col = f"{label} ({unit})" if unit else label
-                dp = next((d for d in datapoints if d.company == c and d.metric == m), None)
-                if dp and dp.ok:
-                    row[col] = dp.value
-                else:
-                    row[col] = None
-            wide_rows.append(row)
-        df_wide = pd.DataFrame(wide_rows)
-        _sanitize_dataframe(df_wide).to_excel(writer, sheet_name="Benchmark", index=False)
 
-        ws = writer.sheets["Benchmark"]
-        # First column wider for company names; metric columns 18-22 chars
-        col_widths = {"Company": 28}
-        for col in df_wide.columns[1:]:
-            col_widths[col] = 22
-        # Number format: $B → 0.00, $M → 0.00, % → 0.0, etc.
-        number_formats = {}
-        for m in metrics_in_run:
-            meta = METRICS.get(m, {})
-            label = meta.get("label", m)
-            unit = meta.get("unit", "")
-            col = f"{label} ({unit})" if unit else label
-            if unit == "%":
-                number_formats[col] = "0.0"
-            elif unit in ("$B", "$M"):
-                number_formats[col] = "#,##0.00"
-            elif unit in ("hrs/yr", "grants", "min/yr"):
-                number_formats[col] = "#,##0"
-            elif unit == "M MT CO2":
-                number_formats[col] = "0.00"
-            elif unit == "/100":
-                number_formats[col] = "0.0"
-        _apply_formatting(ws, title="Benchmark", col_widths=col_widths,
-                          number_format_cols=number_formats)
+def _write_audit_sheet(ws, audit_summary, insights, s):
+    """AI audit + insights, formatted for reading."""
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Alignment
 
-        # ── Sheet 3: Detailed ──────────────────────────────────────────────
-        detailed_rows = []
-        for dp in datapoints:
-            flag_info = flags.get((dp.company, dp.metric), {})
-            meta = METRICS.get(dp.metric, {})
-            detailed_rows.append({
-                "Flag": flag_info.get("flag", ""),
-                "Company": dp.company,
-                "Metric": meta.get("label", dp.metric),
-                "Value": dp.value,
-                "Unit": dp.unit,
-                "Year": dp.year,
-                "Confidence": dp.confidence_score,
-                "Source": (dp.source_name or "")[:120],
-                "Source URL": dp.source_url,
-                "Notes": dp.notes,
-                "Flag reason": flag_info.get("reason", ""),
-            })
-        df_detail = pd.DataFrame(detailed_rows)
-        _sanitize_dataframe(df_detail).to_excel(writer, sheet_name="Detailed", index=False)
+    ws["A1"] = "AI Audit & Insights"
+    ws["A1"].font = s["title_font"]
+    ws.row_dimensions[1].height = 28
 
-        ws = writer.sheets["Detailed"]
-        _apply_formatting(
-            ws, title="Detailed",
-            col_widths={
-                "Flag": 6, "Company": 24, "Metric": 28, "Value": 12,
-                "Unit": 10, "Year": 10, "Confidence": 11, "Source": 40,
-                "Source URL": 50, "Notes": 50, "Flag reason": 50,
-            },
-            number_format_cols={"Value": "#,##0.00", "Confidence": "0.00"},
-        )
+    ws["A2"] = ("Generated by Claude after the data was compiled.  "
+                "Audit reviews each value for plausibility; insights highlight "
+                "strategic findings.")
+    ws["A2"].font = s["subtitle_font"]
+    ws.row_dimensions[2].height = 18
 
-        # ── Sheet 4: Failures & Notes (only if any failures) ───────────────
-        if fail_dps:
-            failure_rows = []
-            for dp in fail_dps:
-                flag_info = flags.get((dp.company, dp.metric), {})
-                meta = METRICS.get(dp.metric, {})
-                failure_rows.append({
-                    "Flag": flag_info.get("flag", "🚩"),
-                    "Company": dp.company,
-                    "Metric": meta.get("label", dp.metric),
-                    "Reason": (dp.error or {}).get("reason", "") if dp.error else "",
-                    "What this means": flag_info.get("reason", ""),
-                    "Sources tried": ", ".join((dp.error or {}).get("attempted_sources", [])),
-                })
-            df_fail = pd.DataFrame(failure_rows)
-            _sanitize_dataframe(df_fail).to_excel(writer, sheet_name="Failures & Notes", index=False)
-            ws = writer.sheets["Failures & Notes"]
-            _apply_formatting(
-                ws, title="Failures & Notes",
-                col_widths={"Flag": 6, "Company": 24, "Metric": 28,
-                            "Reason": 50, "What this means": 60, "Sources tried": 35},
-            )
+    row = 4
+    if audit_summary:
+        ws.cell(row=row, column=1, value="Data quality audit").font = s["section_font"]
+        row += 1
+        for line in (audit_summary or "").split("\n"):
+            line = line.strip()
+            if not line:
+                row += 1
+                continue
+            c = ws.cell(row=row, column=1, value=_sanitize_for_excel(line))
+            c.alignment = s["body_align"]
+            c.font = s["body_font"]
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+            row += 1
+        row += 2
 
-        # ── Sheet 5: AI Audit (only if AI ran) ─────────────────────────────
-        if audit_summary or insights:
-            audit_rows = []
-            if audit_summary:
-                audit_rows.append(["Data quality audit", ""])
-                for line in (audit_summary or "").split("\n"):
-                    audit_rows.append(["", _sanitize_for_excel(line)])
-                audit_rows.append(["", ""])
-            if insights:
-                audit_rows.append(["Strategic insights", ""])
-                for line in (insights or "").split("\n"):
-                    audit_rows.append(["", _sanitize_for_excel(line)])
-            df_audit = pd.DataFrame(audit_rows, columns=["Section", "Content"])
-            df_audit.to_excel(writer, sheet_name="AI Audit", index=False, header=False)
-            ws = writer.sheets["AI Audit"]
-            ws.column_dimensions["A"].width = 30
-            ws.column_dimensions["B"].width = 100
-            for r in range(1, ws.max_row + 1):
-                ws.cell(row=r, column=2).alignment = Alignment(wrap_text=True, vertical="top")
-                v = ws.cell(row=r, column=1).value
-                if v:
-                    ws.cell(row=r, column=1).font = Font(bold=True, color="1F4E79")
+    if insights:
+        ws.cell(row=row, column=1, value="Strategic insights").font = s["section_font"]
+        row += 1
+        for line in (insights or "").split("\n"):
+            line = line.strip()
+            if not line:
+                row += 1
+                continue
+            c = ws.cell(row=row, column=1, value=_sanitize_for_excel(line))
+            c.alignment = s["body_align"]
+            c.font = s["body_font"]
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+            row += 1
 
-        # ── Sheet 6: Attempts log (audit trail, hidden by default) ─────────
-        attempt_rows = []
-        for dp in datapoints:
-            for a in dp.attempts:
-                attempt_rows.append({
-                    "Company": dp.company,
-                    "Metric": dp.metric,
-                    "Source": a.source,
-                    "URL": a.url,
-                    "Method": a.method,
-                    "Status": a.status_code,
-                    "OK": a.success,
-                    "Time (ms)": a.duration_ms,
-                    "Error": a.error,
-                    "Preview": (a.response_preview or "")[:200],
-                })
-        if attempt_rows:
-            df_att = pd.DataFrame(attempt_rows)
-            _sanitize_dataframe(df_att).to_excel(writer, sheet_name="Attempts log", index=False)
-            ws = writer.sheets["Attempts log"]
-            _apply_formatting(
-                ws, title="Attempts log",
-                col_widths={"Company": 22, "Metric": 24, "Source": 30, "URL": 60,
-                            "Method": 12, "Status": 8, "OK": 6, "Time (ms)": 10,
-                            "Error": 40, "Preview": 50},
-            )
-            ws.sheet_state = "hidden"  # hidden by default — user can unhide for debugging
+    ws.column_dimensions["A"].width = 90
+    ws.sheet_view.showGridLines = False
 
-    return path
+
+def _write_attempts_sheet(ws, attempt_rows, s):
+    """Full HTTP attempt log for debugging.  Not pretty but complete."""
+    from openpyxl.utils import get_column_letter
+
+    df = pd.DataFrame(attempt_rows)
+    df = _sanitize_dataframe(df)
+
+    # Header
+    for col_idx, h in enumerate(df.columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell.fill = s["header_fill"]
+        cell.font = s["header_font"]
+        cell.alignment = s["header_align"]
+        cell.border = s["border"]
+
+    for r_offset, (_, rowdata) in enumerate(df.iterrows()):
+        for col_idx, h in enumerate(df.columns, 1):
+            ws.cell(row=2 + r_offset, column=col_idx,
+                    value=_sanitize_for_excel(rowdata[h])).border = s["border"]
+
+    widths = {"Company": 24, "Metric": 24, "Source": 28, "URL": 60, "Method": 12,
+              "Status": 8, "OK": 6, "Time (ms)": 10, "Error": 40, "Preview": 50}
+    for col_idx, h in enumerate(df.columns, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(h, 18)
+
+    ws.freeze_panes = "A2"
+    if df.shape[0] > 0:
+        last_col = get_column_letter(df.shape[1])
+        ws.auto_filter.ref = f"A1:{last_col}{df.shape[0]+1}"
