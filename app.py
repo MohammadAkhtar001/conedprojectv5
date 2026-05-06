@@ -200,121 +200,367 @@ def _draw_metric_chart(df_long, metric_key: str, flags_map: dict, *, height: int
 
 
 def _build_analysis_prompt(datapoints, flags_map: dict) -> str:
-    """Compose a self-contained prompt that another AI can use to do deeper
-    analysis on the just-pulled benchmark data.  Embeds the data as a
-    structured table and asks for a specific kind of analysis."""
+    """Compose a self-contained, per-metric structured prompt for another AI
+    to analyze.  The data is organized as one section per metric so values
+    are unambiguous — never just numbers in a row."""
 
     companies = sorted({dp.company for dp in datapoints})
-    metric_keys_seen = []
+    metric_keys_seen: list[str] = []
     for dp in datapoints:
         if dp.metric not in metric_keys_seen:
             metric_keys_seen.append(dp.metric)
 
-    # Build a markdown table of values
-    header = "| Company | " + " | ".join(
-        f"{METRICS.get(m, {}).get('label', m)} ({METRICS.get(m, {}).get('unit', '')})".strip(" ()")
-        for m in metric_keys_seen
-    ) + " | Notes |"
-    sep = "|" + "|".join("---" for _ in range(len(metric_keys_seen) + 2)) + "|"
-    body_lines = [header, sep]
-    for c in companies:
-        cells = [c]
-        notes_for_row = []
-        for m in metric_keys_seen:
+    # ── Header / context ────────────────────────────────────────────────────
+    n_total = len(datapoints)
+    n_ok = sum(1 for d in datapoints if d.ok)
+    n_fail = n_total - n_ok
+    avg_conf = (
+        sum(d.confidence_score for d in datapoints if d.ok and d.confidence_score)
+        / max(1, sum(1 for d in datapoints if d.ok and d.confidence_score))
+    )
+
+    header = f"""# Utility Benchmark Data — Compiled for Analysis
+
+**Audience:** Con Edison Community Partnerships team (and their VP)
+**Companies benchmarked ({len(companies)}):** {", ".join(companies)}
+**Metrics benchmarked ({len(metric_keys_seen)}):** {", ".join(METRICS.get(m, {}).get("label", m) for m in metric_keys_seen)}
+**Coverage:** {n_ok}/{n_total} pairs returned a value ({n_ok/max(1,n_total)*100:.0f}%) · average confidence {avg_conf:.2f}
+
+## How to read this brief
+
+Each metric below is its own section containing:
+- The unit, what it means, expected range
+- ONE labeled value per company, with flag, source, year, and confidence
+- A "Methodology notes" line explaining the source the pipeline used
+
+**Flag legend** (next to every value):
+- ✅  Verified from a credible source, no concerns
+- ⚠️  Caveat applies (partial coverage, e.g. only the foundation slice of total giving)
+- 🚩  Data exists but the automated tool could not retrieve it — needs manual lookup
+- ℹ️   Legitimately not applicable for this combination (structural reason)
+- —   No value (see flag for why)
+
+## Critical structural facts (do NOT treat these as data errors)
+
+1. **Pure transmission/distribution utilities** (Con Edison, National Grid USA, Eversource, PSEG Long Island) do NOT own electricity-generation plants tracked by EPA eGRID. Their Scope 1 from generation is genuinely zero. Real Scope 1 (vehicle fleet, fugitive gas leaks) is small and only disclosed in CSR reports. ℹ️ does NOT mean the value is missing — it means it doesn't exist in the form requested.
+
+2. **Integrated generators** (Duke Energy, Southern Company, PG&E, Dominion) emit ~10× more Scope 1 CO₂ than distributors. That ratio is structural, not an outlier.
+
+3. **"Total Charitable Giving" from ProPublica is the FOUNDATION-PAID slice only** (IRS Form 990-PF, contributions paid line). It does NOT include direct corporate contributions, energy assistance programs, in-kind giving, or community investment from the operating budget. To assess total philanthropy, look at "Total Charitable Giving" + "Energy Assistance Programs" + "Community Investment" together.
+
+4. **National Grid USA's parent is UK-listed** and does not file US 10-Ks. Its US operating subsidiaries (Niagara Mohawk Power, KeySpan, Massachusetts Electric) historically filed but do not appear in SEC's current company-facts API. Revenue 🚩 is therefore expected and should be filled in manually from National Grid plc's UK Annual Report (US segment).
+
+---
+
+# Data, organized by metric"""
+
+    sections: list[str] = []
+    for m in metric_keys_seen:
+        meta = METRICS.get(m, {})
+        label = meta.get("label", m)
+        unit = meta.get("unit", "")
+        description = meta.get("description", "(custom metric — no standard description)")
+        expected = meta.get("expected_range", "n/a")
+        lower_better = meta.get("lower_is_better", False)
+        direction = "lower is better" if lower_better else "higher is better"
+
+        section_lines = [
+            f"\n## {label}",
+            "",
+            f"- **Unit:** {unit if unit else '(unitless / custom)'}",
+            f"- **What it measures:** {description}",
+            f"- **Expected range:** {expected}",
+            f"- **Direction:** {direction}",
+            "",
+            "**Values by company:**",
+            "",
+        ]
+
+        # Collect rows for this metric
+        rows_for_metric = []
+        for c in companies:
             dp = next((d for d in datapoints if d.company == c and d.metric == m), None)
-            if dp and dp.ok:
-                flag = flags_map.get((c, m), {}).get("flag", "")
-                cells.append(f"{flag} {dp.value:g}".strip())
+            flag_info = flags_map.get((c, m), {})
+            flag = flag_info.get("flag", "")
+            flag_reason = flag_info.get("reason", "")
+            if dp is None:
+                continue
+            if dp.ok:
+                conf_pct = f"{int((dp.confidence_score or 0) * 100)}% confidence" if dp.confidence_score else "—"
+                year_str = dp.year or "year unknown"
+                source_str = (dp.source_name or "unknown source").split(" — ")[0]
+                rows_for_metric.append(
+                    f"- {flag} **{c}**: **{dp.value:g} {unit}**  "
+                    f"_(source: {source_str}, {year_str}, {conf_pct})_"
+                )
+                if dp.notes and ("foundation" in dp.notes.lower() and "only" in dp.notes.lower()):
+                    rows_for_metric.append(
+                        f"    - ⚠️ Caveat: foundation 990-PF slice only; "
+                        f"excludes direct corporate contributions, energy "
+                        f"assistance, and in-kind."
+                    )
             else:
+                rows_for_metric.append(
+                    f"- {flag} **{c}**: **null** — {flag_reason or '(see Failures section)'}"
+                )
+
+        # Sort successful values by value (rank order); failures at the bottom
+        # We've appended in order so sort with a key
+        ok_rows = []
+        fail_rows = []
+        for c in companies:
+            dp = next((d for d in datapoints if d.company == c and d.metric == m), None)
+            if dp is None:
+                continue
+            if dp.ok:
+                ok_rows.append((c, dp))
+            else:
+                fail_rows.append(c)
+
+        # Recompute the sorted output now that we've split
+        section_lines = [
+            f"\n## {label}",
+            "",
+            f"- **Unit:** {unit if unit else '(unitless / custom)'}",
+            f"- **What it measures:** {description}",
+            f"- **Expected range:** {expected}",
+            f"- **Direction:** {direction}",
+        ]
+        if ok_rows:
+            ok_rows.sort(key=lambda x: x[1].value, reverse=not lower_better)
+            section_lines.append("")
+            section_lines.append(
+                f"**Values by company** (sorted "
+                f"{'low → high' if lower_better else 'high → low'}):"
+            )
+            section_lines.append("")
+            for rank, (c, dp) in enumerate(ok_rows, 1):
+                flag = flags_map.get((c, m), {}).get("flag", "")
+                conf_pct = (
+                    f"{int((dp.confidence_score or 0) * 100)}% confidence"
+                    if dp.confidence_score else ""
+                )
+                year_str = dp.year or "year unknown"
+                source_str = (dp.source_name or "unknown source").split(" — ")[0]
+                bullet = (
+                    f"{rank}. {flag} **{c}**: **{dp.value:g} {unit}**".rstrip()
+                    + f"  _({source_str}, {year_str}, {conf_pct})_"
+                )
+                section_lines.append(bullet)
+                # Inline caveat for foundation-only data
+                if (dp.notes and "foundation" in dp.notes.lower()
+                        and "only" in dp.notes.lower()):
+                    section_lines.append(
+                        "    - ⚠️ Foundation 990-PF slice only; excludes "
+                        "direct corporate contributions and in-kind."
+                    )
+        if fail_rows:
+            section_lines.append("")
+            section_lines.append("**No value retrieved for:**")
+            for c in fail_rows:
                 flag = flags_map.get((c, m), {}).get("flag", "🚩")
-                reason = (flags_map.get((c, m), {}).get("reason") or "")[:80]
-                cells.append(f"{flag} —")
-                if reason:
-                    notes_for_row.append(f"{METRICS.get(m, {}).get('label', m)}: {reason}")
-        cells.append("; ".join(notes_for_row[:2]) if notes_for_row else "")
-        body_lines.append("| " + " | ".join(cells) + " |")
+                reason = flags_map.get((c, m), {}).get("reason", "(no reason)")
+                section_lines.append(f"- {flag} **{c}** — {reason}")
 
-    table = "\n".join(body_lines)
+        # Source methodology note
+        method_note = _methodology_note_for_metric(m)
+        if method_note:
+            section_lines.append("")
+            section_lines.append(f"**Methodology:** {method_note}")
 
-    prompt = f"""I have just compiled the following utility-industry benchmark for the Con Edison Community Partnerships team. The data was pulled from regulator-of-record sources where available (SEC EDGAR XBRL for revenue, EPA eGRID for carbon emissions, IRS 990-PF via ProPublica for foundation philanthropy, J.D. Power for customer satisfaction, and CSR/sustainability reports for narrative-disclosed metrics).
+        sections.append("\n".join(section_lines))
 
-Each value carries a flag:
-- ✅ verified from a credible source
-- ⚠️ caveat applies (e.g. partial coverage, or only the foundation slice of total giving)
-- 🚩 data exists somewhere but couldn't be retrieved by the automated tool
-- ℹ️ not applicable for this combination (e.g. carbon emissions for a pure transmission/distribution utility that owns no generation)
-- — indicates a null
+    # ── What we want from the analyst AI ────────────────────────────────────
+    closing = """\
 
-Important structural facts:
-1. Pure T&D distributors (Con Edison, National Grid USA, Eversource, PSEG Long Island) do NOT own generation plants tracked in EPA eGRID, so their Scope 1 emissions reported there will be null. Their actual Scope 1 (vehicle fleet, fugitive gas leaks) is small and disclosed only in CSR reports.
-2. Integrated generators (Duke Energy, Southern Company, PG&E) emit ~10× more Scope 1 CO₂ than distributors — that is structural, not an outlier.
-3. "Charitable Giving" pulled from ProPublica is the FOUNDATION-PAID slice only (IRS Form 990-PF, line for grants paid). It does NOT include direct corporate contributions, energy assistance programs (LIHEAP supplements, hardship funds), or in-kind giving. To get the full picture, look at "Total Charitable Giving" together with "Energy Assistance Programs" and "Community Investment".
+---
 
-## Benchmark data
+# What I want from you
 
-{table}
+Now that you've read every metric, please produce the following five sections.
 
-## What I want from you
+## 1. Critical review of values
+For each metric section above, scan the ✅ values quickly and call out anything that looks wrong: a unit error, a scale mismatch, a value that's implausible given the company's size or business model. Be specific — quote the exact metric and company.
 
-1. **Read the data critically.** For each value, quickly decide if it looks plausible given company size and structure. Call out anything that looks like a unit error, scale mismatch, or peer outlier — especially among the ✅ rows (those are the ones I trust most, so an error there is the most dangerous).
+## 2. Plug the gaps for 🚩 and — values
+For each null, name the specific manual lookup that would resolve it. Examples: "For National Grid USA Revenue, look at the 'US Performance' section of National Grid plc's most recent UK Annual Report." or "For PSEG Long Island Foundation Assets, search ProPublica for 'PSEG Foundation' (parent foundation; LI is a subsidiary)."
 
-2. **Spot the data gaps.** For each 🚩 or — value, suggest where the analyst should look manually (e.g. specific CSR report sections, specific 10-K line items, state PUC dockets).
+## 3. Strategic insights for the Community Partnerships VP (4–6 bullets)
+Each insight starts with a bolded headline, then 1–2 sentences. Focus on:
+- How Con Edison stacks up vs peers, normalized for company size where possible
+- Specific competitive advantages or gaps in Con Edison's philanthropy posture
+- A storyline an executive should know before a board meeting
 
-3. **Write 4–6 strategic insights for the Community Partnerships VP**, focused on:
-   - How Con Edison's philanthropy stacks up vs peers, *normalized for company size* (revenue or customer count)
-   - Where Con Edison appears to have a competitive advantage or gap
-   - Any storyline an executive should know before a board meeting
+## 4. Three concrete follow-up data pulls
+Specific metrics from specific sources. Examples: "Pull Con Edison's K-12 STEM scholarship total from page 24 of their 2024 Sustainability Report." Be precise enough that an analyst could execute each one in under 15 minutes.
 
-4. **Recommend 3 follow-up data pulls** that would sharpen this benchmark — specific metrics from specific sources.
+## 5. Caveats the VP should know before quoting numbers
+Anything that, if mis-stated to the board, would damage credibility. Examples: "Con Edison's $0.03M foundation giving figure is the foundation-paid line only. Total corporate philanthropy is a multiple of that — quoting $0.03M would be misleading."
 
-Keep your response in plain English. No fluff. Do not invent numbers; if you don't have data, say so."""
+Do not invent numbers. If you don't have data, say "I don't have a verifiable source for that." Be ruthlessly specific."""
 
-    return prompt
+    return header + "\n".join(sections) + closing
+
+
+def _methodology_note_for_metric(metric_key: str) -> str:
+    """Return a short methodology note explaining what source/method was
+    used for this metric."""
+    notes = {
+        "revenue": (
+            "SEC EDGAR XBRL company-facts API. Pulled the most recent 10-K "
+            "fiscal-year value of the `us-gaap:Revenues` tag (or close "
+            "equivalent). Confidence 0.95."
+        ),
+        "charitable_giving": (
+            "ProPublica Nonprofit Explorer (IRS 990-PF). Pulled grants paid out "
+            "from the most recent fiscal year. ⚠️ This is the FOUNDATION-PAID "
+            "slice only — does not include direct corporate contributions, "
+            "energy assistance, or in-kind giving. Confidence 0.65."
+        ),
+        "foundation_grants_paid": (
+            "ProPublica Nonprofit Explorer (IRS 990-PF). Same source as Total "
+            "Charitable Giving but explicitly scoped to foundation grants only. "
+            "Confidence 0.85."
+        ),
+        "foundation_assets": (
+            "ProPublica Nonprofit Explorer (IRS 990-PF Part II, totassetsend). "
+            "Confidence 0.85."
+        ),
+        "carbon_emissions": (
+            "EPA eGRID2022 plant-level dataset. Annual CO₂ in short tons summed "
+            "across all plants matching the company's eGRID operator name(s), "
+            "converted to million metric tons (× 0.907185 / 1e6). Confidence "
+            "0.95 for integrated generators; ℹ️ for pure distributors who do not "
+            "own generation."
+        ),
+        "renewable_pct": (
+            "Primary: company CSR/sustainability report. Secondary: EIA Form 923 "
+            "generation mix derivation. Confidence 0.60."
+        ),
+        "saidi": (
+            "EIA Form 861 reliability workbook (when implemented) or state PUC "
+            "filings. Confidence 0.85."
+        ),
+        "customer_satisfaction": (
+            "J.D. Power Residential Electric Satisfaction Study press release. "
+            "Raw score is /1000, normalized to /100. Note: J.D. Power's free "
+            "press release names only regional category WINNERS — most utilities "
+            "will return null with no fault of the pipeline. Confidence 0.50."
+        ),
+        "energy_assistance": (
+            "Company CSR/sustainability report — narrative section on energy "
+            "assistance, LIHEAP supplements, and customer hardship programs. "
+            "Confidence 0.60."
+        ),
+        "stem_education_giving": (
+            "Company CSR/sustainability report — STEM/education narrative or "
+            "foundation 990 grant listings. Confidence 0.60."
+        ),
+        "community_investment": (
+            "Company CSR/sustainability report — community investment summary "
+            "(typically the broadest line that includes philanthropy + economic "
+            "development + customer assistance). Confidence 0.60."
+        ),
+        "volunteer_hours": (
+            "Company CSR/sustainability report. Confidence 0.60."
+        ),
+        "employee_match": (
+            "Company CSR/sustainability report — matching gift program total. "
+            "Confidence 0.60."
+        ),
+        "num_grants": (
+            "ProPublica 990-PF Part XV grant counts, or CSR-report disclosure. "
+            "Confidence 0.85 (regulator) / 0.60 (CSR)."
+        ),
+    }
+    return notes.get(metric_key, "Custom metric — extracted via fuzzy match to "
+                                 "closest standard metric, or AI web search.")
 
 
 def _build_recreation_prompt() -> str:
     """A detailed meta-prompt that another AI can use to mimic this tool's
-    behavior interactively."""
+    behavior interactively, including all sources, methodology, and rules."""
 
-    return """# Utility Benchmark Pipeline — interactive recreation
+    return """# Utility Benchmark Pipeline — Interactive Mode
 
-You are an analyst's research assistant. The user is going to ask you to benchmark US electric and gas utilities on operational, ESG, and philanthropy metrics. Behave like a hand-built, per-source data pipeline — not a generic LLM that hallucinates numbers. The exact rules below are non-negotiable.
+You are a hand-built data pipeline for benchmarking US electric and gas utilities. The user will give you a list of companies and a list of metrics, and you will compile a benchmark — pulling values from real sources, scoring confidence, flagging issues, and refusing to invent numbers.
 
-## Your data-source priority order
+You are not a generic LLM. You behave like a specific tool with specific rules. Every value you return must be from a real source you can cite. When you can't find a value, you return null with a structured reason — never a guess.
 
-For each (company, metric) pair, work down this list and STOP at the first source that returns a value:
+---
 
-1. **SEC EDGAR XBRL company-facts API** — for Revenue and any other GAAP-tagged financials. URL pattern: `https://data.sec.gov/api/xbrl/companyfacts/CIK{10digit}.json`. Pull from the most recent 10-K, fiscal-year (`fp=FY`) entry. Tag is `us-gaap:Revenues` or its equivalents. Confidence: 0.95.
+## PART 1 — Source priority order (walk this for EVERY metric)
 
-2. **ProPublica Nonprofit Explorer** — for foundation philanthropy. URL pattern: `https://projects.propublica.org/nonprofits/api/v2/organizations/{ein_numeric}.json`. Search by foundation name first (`/search.json?q=...`) since hard-coded EINs are fragile. The relevant 990-PF fields are `cttgrntpd` / `grntspaid` (grants paid out) and `totassetsend` (total assets at year end). Confidence: 0.85. If you only return foundation-paid giving, FLAG that it's a partial picture — it excludes direct corporate contributions and energy assistance.
+For each (company, metric) pair, walk the source list IN ORDER. Stop at the FIRST source that returns a usable value. If all sources fail, return null with the reasons.
 
-3. **EPA eGRID** — for Scope 1 carbon emissions. Latest release URL: `https://www.epa.gov/system/files/documents/2024-01/egrid2022_data.xlsx`. Read the PLNT22 sheet (header row 2). Sum `PLCO2AN` (annual plant CO₂ in short tons) by `OPRNAME` (operator name). Convert short tons to million metric tons: × 0.907185 / 1e6. Confidence: 0.95. Pure T&D distributors will return zero plants and that is correct — their Scope 1 from generation is genuinely zero; flag as "not applicable" not "missing data".
+### Tier 1: Government / regulator APIs (preferred, highest confidence)
 
-4. **EIA Form 861** — for SAIDI and renewable energy %. Annual XLSX from `https://www.eia.gov/electricity/data/eia861/`. Filter by EIA Operator ID. Confidence: 0.85.
+#### A. SEC EDGAR XBRL company-facts API — Revenue
+- **URL pattern:** `https://data.sec.gov/api/xbrl/companyfacts/CIK{10digit}.json`
+- **Auth:** None, but SEC requires a contact email in the User-Agent header. Generic UAs get 403.
+- **Method:** Fetch the JSON. Look for `facts.us-gaap.Revenues.units.USD`. Filter to entries where `form == "10-K"` and `fp == "FY"`. Sort by `end` descending; take the most recent.
+- **Output:** value (in dollars, divide by 1e9 for $B), `fy` field as year, the filing accession number for source URL.
+- **Confidence:** 0.95.
+- **Common CIKs:** Con Edison 0001047862; Duke 0001326160; Eversource 0000072741; PG&E (parent) 0001004980; Southern Co 0000092122; Dominion 0000715957; Exelon 0001109357; AEP 0000004904.
 
-5. **J.D. Power** — for residential customer satisfaction. Press-release page: `https://www.jdpower.com/business/press-releases/2024-us-electric-utility-residential-customer-satisfaction-study`. ONLY regional category winners are publicly named — for everyone else this is a null and should not be considered a bug. Confidence: 0.50.
+#### B. ProPublica Nonprofit Explorer — Foundation philanthropy
+- **Search URL:** `https://projects.propublica.org/nonprofits/api/v2/search.json?q={name}`
+- **Org URL:** `https://projects.propublica.org/nonprofits/api/v2/organizations/{ein_int}.json`
+- **Method:** Search by foundation name (e.g. "Consolidated Edison Foundation"). Score candidates: prefer names containing "foundation" + the company's distinctive word. Penalize "welfare benefit", "master trust", "pension", "society", "international". Take the highest-scoring match. Then fetch the full org record. Use the most recent entry in `filings_with_data`.
+- **Field mapping (IRS 990-PF):**
+  - Charitable giving / grants paid → `cttgrntpd` or `grntspaid` or `cttgfgvprtcamt` (the "contributions, gifts, grants paid" line). Convert dollars → millions.
+  - Foundation assets → `totassetsend`. Convert dollars → millions.
+- **CRITICAL CAVEAT:** This is the FOUNDATION-PAID slice only. It does NOT include direct corporate contributions, energy assistance, in-kind, or community investment from operating budget. When you return a value here, FLAG it ⚠️ with this note.
+- **Confidence:** 0.85 for foundation_grants_paid; 0.65 for "Total Charitable Giving" (downgraded because it's a partial picture).
 
-6. **Corporate sustainability / CSR report PDF** — for narrative-disclosed metrics: energy assistance programs, volunteer hours, employee match, community investment, STEM education giving. Locate the most recent PDF, extract text, search for distinctive phrases ("$X million in energy assistance", "Y volunteer hours", etc.). Confidence: 0.60.
+#### C. EPA eGRID — Scope 1 carbon emissions
+- **URL:** `https://www.epa.gov/system/files/documents/2024-01/egrid2022_data.xlsx` (latest as of Q1 2024). For 2025 onward, use eGRID2023: `https://www.epa.gov/system/files/documents/2025-01/egrid2023_data.xlsx`.
+- **Method:** Download the Excel workbook. Read sheet `PLNT22` (or `PLNT23`) with `header=1` (row 2 is the column-codes row). Filter rows where `OPRNAME` matches the company's eGRID operator name(s). Sum `PLCO2AN` (annual plant CO₂ in short tons). Convert: `(short_tons * 0.907185) / 1e6` → million metric tons.
+- **Operator-name normalization is required:** eGRID writes "Pacific Gas & Electric Company" but the registry might say "Pacific Gas and Electric Company". Collapse `&` ↔ `and`, strip punctuation, normalize whitespace before substring matching.
+- **Confidence:** 0.95 for integrated generators.
+- **CRITICAL:** Pure T&D distributors (Con Edison, National Grid USA, Eversource, PSEG Long Island) do NOT own generation tracked by eGRID. They will return ZERO matched plants. This is NOT an error — flag ℹ️ "not applicable" with explanation. Do not retry.
 
-7. **AI / web-search fallback** (this is YOU, when other sources fail) — search the web for the metric, prefer regulator filings and CSR reports, fall back to news with reduced confidence. Confidence: 0.30–0.85 depending on source. **Refuse to guess.** If no credible source exists, return null with reason.
+#### D. EIA Form 861 — SAIDI, generation mix, renewable %
+- **URL:** `https://www.eia.gov/electricity/data/eia861/` (annual ZIP download)
+- **Method:** Download zip, read the "Reliability" workbook, filter by EIA Operator ID. Pull SAIDI With MED. For multi-sub utilities, customer-weighted average across subs.
+- **Confidence:** 0.85.
 
-## Hard rules
+### Tier 2: Third-party surveys
 
-- **No fallback / mock / seed data, ever.** A failed extraction returns null with a structured reason — never a substituted value.
-- **Every value carries a confidence score and a source URL.** No values without provenance.
-- **Validate every value against a plausibility range** before accepting it. Revenue $5,000B is wrong (probably USD vs billions confusion). Renewable % above 100 is wrong. Reject and report null with reason.
-- **Quote at most one short fact per source.** Always paraphrase otherwise.
-- **Distinguish "not applicable" from "we couldn't find it"** — see flag philosophy below.
+#### E. J.D. Power Residential Electric Customer Satisfaction Study
+- **URL pattern:** `https://www.jdpower.com/business/press-releases/{year}-us-electric-utility-residential-customer-satisfaction-study`
+- **Method:** Fetch HTML, parse with BeautifulSoup, search for the company name and find the nearest 3-digit number in 600–900 range (raw J.D. Power score is /1000). Normalize to /100 by dividing by 10.
+- **Confidence:** 0.50.
+- **HARD LIMIT — KNOW THIS:** J.D. Power's free press release names ONLY regional category WINNERS (typically 7-8 utilities like PSE&G, Delmarva, MidAmerican, Omaha PPD, Georgia Power, EPB, SRP). Most utilities are NOT named in the public press release. Returning null for non-winners is correct. Detailed scores require a paid subscription.
 
-## Plausible ranges per metric (reject values outside these)
+### Tier 3: Corporate disclosure
+
+#### F. Corporate Sustainability / CSR report PDF
+- Used for: renewable_pct, energy_assistance, volunteer_hours, employee_match, num_grants, community_investment, stem_education_giving.
+- **Method:** Fetch the most recent CSR report URL (must be hand-curated per company), download PDF, extract text with pdfplumber, run anchored regex patterns for each metric. Patterns are ANCHORED to a distinctive phrase (e.g. "energy assistance" + a $-amount window). Always validate the captured number against the metric's plausible range — if it fails validation, return null with reason rather than passing through.
+- **Confidence:** 0.60.
+
+### Tier 4: AI + web search (last resort)
+
+#### G. AI fallback (this is YOU)
+- Triggered when: no government source matched, OR custom user-defined metric, OR all higher tiers returned null.
+- **Method:** Use web search to find the metric. Prefer regulator filings → CSR reports → reputable news. ALWAYS cite the source URL.
+- **Confidence:** 0.85 if from regulator, 0.60 if from CSR, 0.50 if from third-party survey, 0.30 if from press release / news.
+- **Refuse to guess.** If you cannot find a credible source, return null with reason.
+
+---
+
+## PART 2 — Validation rules (apply to every value before accepting it)
+
+Reject any value outside the plausibility range. Don't pass it through with a warning — null it out with a clear reason. The whole point is that we'd rather give the user "no data, here's why" than a wrong number.
 
 | Metric | Unit | Min | Max | Expected |
 |---|---|---|---|---|
-| Revenue | $B | 1 | 80 | $10B–$35B |
-| Renewable Energy % | % | 0 | 100 | 15%–50% |
+| Revenue | $B | 1 | 80 | $10B–$35B large IOUs |
+| Renewable Energy % | % | 0 | 100 | 15%–50% (2024) |
 | SAIDI | min/yr | 20 | 500 | 50–200 |
-| Customer satisfaction | /100 | 30 | 80 | 45–55 |
-| Carbon Emissions Scope 1 | M MT CO2 | 0.5 | 200 | 2–10 distributor / 50–100 generator |
+| Customer satisfaction | /100 | 30 | 80 | 45–55 (industry avg ≈ 49.9) |
+| Carbon Emissions Scope 1 | M MT CO2 | 0.5 | 200 | 2–10 distributors / 50–100 generators |
 | Total Charitable Giving | $M | 0.01 | 500 | $5M–$100M large utility |
 | Foundation Grants Paid | $M | 0.01 | 200 | $0.5M–$20M |
 | Foundation Assets | $M | 0.5 | 500 | $5M–$100M |
@@ -324,23 +570,75 @@ For each (company, metric) pair, work down this list and STOP at the first sourc
 | Volunteer Hours | hrs/yr | 100 | 500,000 | 5,000–100,000 |
 | Employee Match | $M | 0.05 | 50 | $0.5M–$10M |
 
-## Flag system on every value
+---
 
-- ✅ Verified from a credible source, no concerns
-- ⚠️ Caveat applies (partial coverage, foundation slice only, mid-tier confidence)
-- 🚩 Data likely exists but couldn't be retrieved, OR very low confidence (< 0.30)
-- ℹ️ Not applicable for this combo (genuine structural reason — pure distributor for carbon, no SEC filings for foreign-parent companies, etc.)
+## PART 3 — The flag system (apply to every value)
 
-## Workflow when the user asks
+Every value you output gets a flag based on these rules:
 
-1. Ask the user for the list of companies and metrics they want to benchmark.
-2. For each (company, metric) pair, walk the source priority list, ATTEMPT EACH SOURCE, and report what you find — including failures and the reasons.
-3. Output a wide table (companies × metrics) with flag emoji + value in each cell.
-4. List any null cells in a "Failures & Notes" section explaining why each one came back null.
-5. Run a quality-scan pass: for each ✅ value, ask yourself whether it's plausible vs the company's size and the peer median. Downgrade to ⚠️ or 🚩 if not.
-6. Write 3–5 strategic insights for the user's stated audience.
+- **✅** Successful value with confidence ≥ 0.50 from a credible source, NOT a peer outlier, no caveats.
+- **⚠️** Value is correct but has a caveat the user should know:
+  - Foundation-only data when a "total" was implied
+  - Confidence between 0.30 and 0.49
+  - Value is 3–10× the peer median for that metric (potential scale mismatch)
+- **🚩** Genuine concern OR data exists but couldn't be retrieved:
+  - Confidence < 0.30 (press-release / news only)
+  - Peer outlier ≥ 10× the median AND low confidence
+  - Foundation not found on ProPublica (so we know there's a gap)
+  - Custom metric with no extractor and no AI fallback available
+  - Anthropic API error (credit, auth)
+- **ℹ️** Legitimately not applicable for this combination:
+  - Carbon Emissions for a pure T&D distributor (no eGRID generation)
+  - SEC Revenue for a non-SEC-registered company (e.g. UK parent's US sub)
+  - Customer Satisfaction for a non-J.D.-Power-named company
+  - Any case where the data genuinely doesn't exist for this scope
 
-When uncertain, say "I don't have a verifiable source for that — would you like me to flag it for manual review?" Never guess."""
+NEVER use 🚩 as a default for "no value". Pick the right flag based on the cause.
+
+---
+
+## PART 4 — Hard rules (non-negotiable)
+
+1. **No fallback / mock / seed data.** Failed extraction returns null with a structured reason. Never substitute a placeholder.
+2. **Every value carries a confidence score and a source URL.** No values without provenance.
+3. **Validate every value against the plausibility range before accepting it.**
+4. **Quote at most one short fact per source.** Always paraphrase otherwise.
+5. **Distinguish "not applicable" from "we couldn't find it"** — the flag system enforces this.
+6. **Never modify or correct a structured value with AI judgment.** AI's job is to ANNOTATE (audit, flag), not to overwrite. If a value looks wrong, FLAG it; don't replace it.
+
+---
+
+## PART 5 — Workflow when the user gives you input
+
+When the user says something like "benchmark Con Edison, Duke, and PG&E on revenue, charitable giving, and carbon emissions":
+
+1. **Confirm the inputs.** Echo back the company list and metric list to make sure you parsed them correctly. If a custom metric isn't in the standard list, fuzzy-match it (e.g. "program_grants_education" → "stem_education_giving") and tell the user which standard metric you're routing it to.
+
+2. **For each (company × metric), walk the source priority list.** Tell the user which source you tried and what happened. Be transparent.
+
+3. **Compile the wide table.** Companies as rows, metrics as columns, flag emoji + value in each cell.
+
+4. **Compile the per-metric breakdown.** For EACH metric, write a section with:
+   - Unit and what it measures
+   - Expected range
+   - Each company's value with flag, source, year, and confidence
+   - A one-line methodology note
+
+5. **Run a quality scan.** Re-check every ✅ value against expected range and peer plausibility. Downgrade flags as needed.
+
+6. **Flag failures by cause.** For every null, give the user a tailored explanation, not a generic "no value found."
+
+7. **Write 4–6 strategic insights** for the user's stated audience, with bolded headlines.
+
+8. **Recommend 3 specific follow-up data pulls** that would close gaps in the benchmark.
+
+When uncertain: "I don't have a verifiable source for that — would you like me to flag it for manual review?" Never guess.
+
+---
+
+## PART 6 — Tone
+
+You are speaking to a Community Partnerships analyst. Be direct, specific, and useful. No filler. Every sentence should either inform a decision or warn about a risk. Plain English, not consultant-speak. When the data has a problem, name it clearly. When the data is solid, just say so and move on."""
 
 
 # ── Sidebar — inputs ────────────────────────────────────────────────────────
@@ -360,17 +658,43 @@ with st.sidebar:
         options=registry_options,
         default=registry_options[:4],
     )
-    custom_companies_raw = st.text_area(
-        "Custom companies (one per line)",
-        value="",
-        height=70,
-        placeholder="Exelon\nDominion Energy",
-        help="Any company name. The pipeline will try AI fallback (web search) "
-             "if no government-API ID can be resolved.",
-    )
-    custom_companies = [
-        line.strip() for line in custom_companies_raw.splitlines() if line.strip()
-    ]
+
+    # ── Custom companies: input + Add button + chip list ────────────────────
+    if "custom_companies" not in st.session_state:
+        st.session_state["custom_companies"] = []
+
+    st.markdown("**Custom companies**")
+    if st.session_state["custom_companies"]:
+        st.caption("Click ✕ to remove an entry:")
+        # Render in rows of up to 3 chips
+        chips = st.session_state["custom_companies"]
+        for i, name in enumerate(chips):
+            col_name, col_x = st.columns([5, 1])
+            with col_name:
+                st.markdown(f"• {name}")
+            with col_x:
+                if st.button("✕", key=f"rm_co_{i}", help=f"Remove {name}"):
+                    st.session_state["custom_companies"].pop(i)
+                    st.rerun()
+    else:
+        st.caption("None added yet. Type a name below and click **Add**.")
+
+    new_co_col_input, new_co_col_btn = st.columns([4, 1])
+    with new_co_col_input:
+        new_co = st.text_input(
+            "Add a company",
+            key="new_company_input",
+            placeholder="Exelon",
+            label_visibility="collapsed",
+        )
+    with new_co_col_btn:
+        if st.button("Add", key="add_company_btn", use_container_width=True):
+            cleaned = (new_co or "").strip()
+            if cleaned and cleaned not in st.session_state["custom_companies"]:
+                st.session_state["custom_companies"].append(cleaned)
+                st.rerun()
+
+    custom_companies = st.session_state["custom_companies"]
     companies = selected_registry + custom_companies
 
     st.subheader("Metrics")
@@ -382,17 +706,44 @@ with st.sidebar:
                  "carbon_emissions"],
         format_func=lambda k: metric_labels[k],
     )
-    custom_metrics_raw = st.text_area(
-        "Custom metrics (one per line)",
-        value="",
-        height=70,
-        placeholder="women_in_leadership_pct\nprogram_grants_education",
-        help="Any metric. Custom metrics route directly to the AI fallback "
-             "(web search) since there's no purpose-built extractor.",
-    )
-    custom_metrics = [
-        line.strip() for line in custom_metrics_raw.splitlines() if line.strip()
-    ]
+
+    # ── Custom metrics: input + Add button + chip list ──────────────────────
+    if "custom_metrics" not in st.session_state:
+        st.session_state["custom_metrics"] = []
+
+    st.markdown("**Custom metrics**")
+    if st.session_state["custom_metrics"]:
+        st.caption("Click ✕ to remove:")
+        for i, name in enumerate(st.session_state["custom_metrics"]):
+            col_name, col_x = st.columns([5, 1])
+            with col_name:
+                st.markdown(f"• {name}")
+            with col_x:
+                if st.button("✕", key=f"rm_mt_{i}", help=f"Remove {name}"):
+                    st.session_state["custom_metrics"].pop(i)
+                    st.rerun()
+    else:
+        st.caption(
+            "None added yet. Type a metric name (custom metrics route to "
+            "the closest standard metric, or to the AI fallback)."
+        )
+
+    new_mt_col_input, new_mt_col_btn = st.columns([4, 1])
+    with new_mt_col_input:
+        new_mt = st.text_input(
+            "Add a metric",
+            key="new_metric_input",
+            placeholder="program_grants_education",
+            label_visibility="collapsed",
+        )
+    with new_mt_col_btn:
+        if st.button("Add", key="add_metric_btn", use_container_width=True):
+            cleaned = (new_mt or "").strip()
+            if cleaned and cleaned not in st.session_state["custom_metrics"]:
+                st.session_state["custom_metrics"].append(cleaned)
+                st.rerun()
+
+    custom_metrics = st.session_state["custom_metrics"]
     metrics = selected_metrics + custom_metrics
 
     st.divider()
