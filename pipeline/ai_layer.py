@@ -135,3 +135,197 @@ Return a markdown bullet list. Use **bold** for headlines."""
     except Exception as e:
         log.warning("AI insights failed: %s", e)
         return f"(AI insights failed: {e})"
+
+
+# ── Quality scan: per-value flags ────────────────────────────────────────────
+
+
+def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]:
+    """Quick, deterministic flagging that runs without an API key.
+
+    Returns: {(company, metric): {"flag": "✅"|"⚠️"|"🚩", "reason": "..."}}
+
+    Rules:
+      🚩  no value (failed extraction)
+      🚩  confidence < 0.50  (third-party survey or worse)
+      🚩  value is a peer-group outlier (≥5× peer median, except for
+          structurally-explained metrics like carbon_emissions)
+      ⚠️  confidence 0.50–0.69 (CSR PDF, scraped sources)
+      ⚠️  value flagged as foundation-only when "total" was implied
+      ✅  confidence ≥ 0.70  AND  no other concerns
+    """
+    flags: dict[tuple[str, str], dict] = {}
+
+    # First pass: per-metric peer medians for outlier detection
+    peer_values: dict[str, list[float]] = {}
+    for dp in datapoints:
+        if dp.ok and dp.value is not None:
+            peer_values.setdefault(dp.metric, []).append(dp.value)
+
+    for dp in datapoints:
+        key = (dp.company, dp.metric)
+
+        if not dp.ok:
+            flags[key] = {"flag": "🚩", "reason": "no value extracted"}
+            continue
+
+        c = dp.confidence_score or 0
+        notes_lower = (dp.notes or "").lower()
+
+        if c < 0.50:
+            flags[key] = {
+                "flag": "🚩",
+                "reason": f"low confidence ({c:.2f}) — third-party / scraped source",
+            }
+            continue
+
+        # Peer-outlier check (skip metrics where structural variance is normal)
+        if dp.metric not in ("carbon_emissions",):
+            peers = [v for v in peer_values.get(dp.metric, []) if v != dp.value]
+            if len(peers) >= 2:
+                peers.sort()
+                median = peers[len(peers) // 2]
+                if median > 0:
+                    ratio = dp.value / median
+                    if ratio >= 5.0 or (0 < ratio <= 0.2):
+                        flags[key] = {
+                            "flag": "🚩",
+                            "reason": (f"peer outlier: {dp.value} is "
+                                       f"{ratio:.1f}× peer median ({median})"),
+                        }
+                        continue
+
+        # "Foundation only" caveat for charitable_giving
+        if dp.metric == "charitable_giving" and "foundation" in notes_lower:
+            flags[key] = {
+                "flag": "⚠️",
+                "reason": "foundation slice only — does not include direct corporate giving",
+            }
+            continue
+
+        if 0.50 <= c < 0.70:
+            flags[key] = {
+                "flag": "⚠️",
+                "reason": f"medium confidence ({c:.2f}) — CSR / non-regulator source",
+            }
+            continue
+
+        flags[key] = {"flag": "✅", "reason": f"confidence {c:.2f}, no concerns flagged"}
+
+    return flags
+
+
+def ai_quality_scan(datapoints: list[DataPoint]) -> Optional[dict[tuple[str, str], dict]]:
+    """AI-powered quality scan.  Augments rule_based_flags with Claude's
+    judgment about plausibility, scale errors, and source-credibility issues.
+
+    Returns the same shape as rule_based_flags or None if AI unavailable.
+    """
+    client = _client()
+    if not client:
+        return None
+
+    rows = []
+    for dp in datapoints:
+        if not dp.ok:
+            continue
+        meta = METRICS.get(dp.metric, {})
+        rows.append({
+            "company": dp.company,
+            "metric": dp.metric,
+            "label": meta.get("label", dp.metric),
+            "value": dp.value,
+            "unit": dp.unit,
+            "year": dp.year,
+            "source": dp.source_name,
+            "confidence": dp.confidence_score,
+            "expected_range": meta.get("expected_range", ""),
+        })
+    if not rows:
+        return None
+
+    prompt = f"""You are an experienced utility-industry data analyst auditing a freshly compiled benchmark. For EACH row below, decide if the value looks correct.
+
+Output a single JSON object: a map keyed by "company||metric" (use double-pipe), value is {{"flag": "✅"|"⚠️"|"🚩", "reason": "<one short sentence>"}}.
+
+Use:
+  ✅  value looks correct and from a credible source
+  ⚠️  value is plausible but has a caveat (partial coverage, dated, methodology mismatch)
+  🚩  value looks wrong (off by an order of magnitude, wrong unit, implausibly small/large for company size)
+
+Structural facts that are NOT errors (so do not flag for these):
+- Integrated generators (Duke, Southern, Dominion, PG&E) emit ~10× more Scope 1 CO₂ than pure distributors (Con Edison, National Grid USA, Eversource).
+- Foundation grants paid varies year-to-year; small amounts in off-years can be real.
+- Pure T&D distributors legitimately have null/zero eGRID Scope 1 emissions (no owned generation).
+
+Rows:
+{json.dumps(rows, indent=2, default=str)}
+
+Return ONLY the JSON object — no prose, no markdown fences."""
+
+    try:
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in msg.content if b.type == "text").strip()
+    except Exception as e:
+        log.warning("AI quality_scan failed: %s", e)
+        return None
+
+    # Parse the JSON map
+    import re
+    cleaned = re.sub(r"^```json\s*|```$", "", text, flags=re.MULTILINE).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < 0:
+        return None
+    try:
+        raw = json.loads(cleaned[start:end + 1])
+    except json.JSONDecodeError as e:
+        log.warning("AI quality_scan returned invalid JSON: %s", e)
+        return None
+
+    # Convert "company||metric" → (company, metric) keys
+    out: dict[tuple[str, str], dict] = {}
+    for k, v in raw.items():
+        if "||" not in k or not isinstance(v, dict):
+            continue
+        company, metric = k.split("||", 1)
+        flag = v.get("flag", "")
+        if flag not in ("✅", "⚠️", "🚩"):
+            continue
+        out[(company, metric)] = {
+            "flag": flag,
+            "reason": str(v.get("reason", ""))[:300],
+        }
+    return out
+
+
+def merged_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]:
+    """Combine rule-based flags with AI scan when available.  AI flags take
+    precedence when they're more severe (🚩 > ⚠️ > ✅) — the rule-based
+    confidence floor is preserved as a baseline."""
+    rules = rule_based_flags(datapoints)
+    ai = ai_quality_scan(datapoints) or {}
+
+    severity = {"🚩": 3, "⚠️": 2, "✅": 1}
+    merged: dict[tuple[str, str], dict] = {}
+    for key in set(rules) | set(ai):
+        r = rules.get(key)
+        a = ai.get(key)
+        if r and a:
+            if severity[a["flag"]] >= severity[r["flag"]]:
+                merged[key] = {
+                    "flag": a["flag"],
+                    "reason": f"AI: {a['reason']}",
+                }
+            else:
+                merged[key] = {
+                    "flag": r["flag"],
+                    "reason": r["reason"],
+                }
+        else:
+            merged[key] = a or r
+    return merged
