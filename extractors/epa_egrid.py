@@ -113,9 +113,20 @@ class EpaEgridExtractor(Extractor):
             )]
 
         # Build operator-name target list defensively: only non-empty strings.
+        # Apply NORMALIZATION: collapse "&" ↔ "and", strip punctuation, normalize
+        # whitespace.  Without this, "Pacific Gas and Electric Company" (registry)
+        # won't match "Pacific Gas & Electric Company" (eGRID's spelling).
+        import re as _re_egrid
+
+        def _norm(s: str) -> str:
+            s = str(s).lower().strip()
+            s = s.replace("&", " and ")
+            s = _re_egrid.sub(r"[,.\-_/]", " ", s)
+            s = _re_egrid.sub(r"\s+", " ", s)
+            return s.strip()
+
         targets = [
-            str(n).lower().strip()
-            for n in company.egrid_operator_names
+            _norm(n) for n in company.egrid_operator_names
             if isinstance(n, str) and n.strip()
         ]
         if not targets:
@@ -126,8 +137,9 @@ class EpaEgridExtractor(Extractor):
                 attempts=attempts,
             )]
 
-        # Match plant rows whose OPRNAME contains (or is contained by) any target.
-        op_lower = df[operator_col].astype(str).str.lower().fillna("")
+        # Match plant rows whose normalized OPRNAME contains (or is contained
+        # by) any normalized target name.
+        op_normalized = df[operator_col].astype(str).map(_norm).fillna("")
 
         def matches(s: str) -> bool:
             if not isinstance(s, str) or not s:
@@ -140,7 +152,7 @@ class EpaEgridExtractor(Extractor):
             return False
 
         try:
-            mask = op_lower.apply(matches)
+            mask = op_normalized.apply(matches)
             matched = df[mask]
         except Exception as e:
             return [make_failure(
