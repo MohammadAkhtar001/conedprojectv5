@@ -66,19 +66,51 @@ METRICS: dict[str, dict[str, Any]] = {
         "expected_range": "Distributors 2–10 M MT  |  Integrated generators 50–100 M MT",
         "description": "Scope 1 CO₂e from owned generation. EPA eGRID is the regulator-of-record.",
     },
-    "charitable_giving": {
-        "label": "Charitable Giving",
+    # ── Philanthropy: split into specific sub-metrics ───────────────────────
+    # The previous single "charitable_giving" was misleading because it only
+    # captured foundation-paid grants from the corporate foundation's 990-PF.
+    # Real corporate philanthropy comes from multiple channels:
+    #   1. The corporate foundation (separate 501(c)(3)) — IRS 990-PF data
+    #   2. Direct corporate contributions (operating-budget giving) — CSR
+    #   3. Energy assistance programs (LIHEAP supplements, hardship funds)
+    #   4. Economic / community development grants
+    #   5. In-kind contributions (volunteer time, tree-planting, etc.)
+    # We expose them separately so the user knows what they're comparing.
+    "foundation_grants_paid": {
+        "label": "Foundation Grants Paid",
         "unit": "$M",
         "category": "philanthropy",
         "lower_is_better": False,
-        # Lowered floor from 0.5 to 0.01: utility foundations sometimes have
-        # off-years where grants paid drop well below $500k (e.g. asset
-        # rebalancing, distribution timing).  $10k floor is still high enough
-        # to catch obvious zero / typo values.
         "plausible_min": 0.01,
         "plausible_max": 200.0,
-        "expected_range": "$5M – $50M for large US utilities (smaller in off-years)",
-        "description": "Total cash giving (foundation grants paid + corporate contributions).",
+        "expected_range": "$0.5M – $20M for utility corporate foundations",
+        "description": ("Grants paid out by the company's 501(c)(3) corporate "
+                        "foundation (IRS 990-PF Part I, contributions paid). "
+                        "Excludes operating-budget giving."),
+    },
+    "charitable_giving": {
+        "label": "Total Charitable Giving",
+        "unit": "$M",
+        "category": "philanthropy",
+        "lower_is_better": False,
+        "plausible_min": 0.01,
+        "plausible_max": 500.0,
+        "expected_range": "$5M – $100M for large US utilities",
+        "description": ("Total corporate giving — foundation grants paid PLUS "
+                        "direct corporate contributions PLUS in-kind. Combines "
+                        "990-PF data with CSR disclosure when available."),
+    },
+    "community_investment": {
+        "label": "Community Investment",
+        "unit": "$M",
+        "category": "philanthropy",
+        "lower_is_better": False,
+        "plausible_min": 0.1,
+        "plausible_max": 500.0,
+        "expected_range": "$10M – $100M for large US utilities (broader than philanthropy alone)",
+        "description": ("Total community-facing investment — philanthropy + "
+                        "economic development grants + customer assistance + "
+                        "in-kind. Typically CSR-disclosed."),
     },
     "foundation_assets": {
         "label": "Foundation Assets",
@@ -91,14 +123,26 @@ METRICS: dict[str, dict[str, Any]] = {
         "description": "Foundation total assets at fiscal year-end (IRS 990-PF Part II).",
     },
     "energy_assistance": {
-        "label": "Energy Assistance",
+        "label": "Energy Assistance Programs",
         "unit": "$M",
         "category": "philanthropy",
         "lower_is_better": False,
         "plausible_min": 0.1,
         "plausible_max": 100.0,
-        "expected_range": "$1M – $20M depending on territory size",
-        "description": "Utility-funded customer hardship + LIHEAP supplements.",
+        "expected_range": "$1M – $30M depending on territory size",
+        "description": ("Utility-funded customer hardship + LIHEAP supplements + "
+                        "bill-pay assistance + weatherization. From CSR disclosure."),
+    },
+    "stem_education_giving": {
+        "label": "STEM / Education Giving",
+        "unit": "$M",
+        "category": "philanthropy",
+        "lower_is_better": False,
+        "plausible_min": 0.05,
+        "plausible_max": 50.0,
+        "expected_range": "$0.5M – $10M for utility STEM/education programs",
+        "description": ("Targeted giving to STEM, K-12 education, scholarships, "
+                        "workforce development. From CSR or foundation 990 grant lists."),
     },
     "num_grants": {
         "label": "Number of Grants",
@@ -106,8 +150,8 @@ METRICS: dict[str, dict[str, Any]] = {
         "category": "philanthropy",
         "lower_is_better": False,
         "plausible_min": 5,
-        "plausible_max": 2000,
-        "expected_range": "50 – 600 grants/yr for utility foundations",
+        "plausible_max": 5000,
+        "expected_range": "50 – 1500 grants/yr for utility foundations",
         "description": "Total grants paid (IRS 990-PF Part XV).",
     },
     "volunteer_hours": {
@@ -116,8 +160,8 @@ METRICS: dict[str, dict[str, Any]] = {
         "category": "philanthropy",
         "lower_is_better": False,
         "plausible_min": 100,
-        "plausible_max": 200000,
-        "expected_range": "5,000 – 50,000 hrs/yr",
+        "plausible_max": 500000,
+        "expected_range": "5,000 – 100,000 hrs/yr",
         "description": "Employee volunteer hours (CSR-disclosed).",
     },
     "employee_match": {
