@@ -9,4 +9,5 @@ plotly>=5.18
 python-dotenv>=1.0
 playwright>=1.40
 anthropic>=0.49
+google-genai>=0.3
 tenacity>=8.2
