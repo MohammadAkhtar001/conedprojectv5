@@ -76,22 +76,32 @@ def _client():
 # These persist across all calls to extract() within a single Python
 # process, so that as the orchestrator iterates over (company × metric)
 # pairs the pacing knowledge carries forward.
-#
-# Anthropic Sonnet/Haiku free + low tiers cap at ~30K input tokens/minute.
-# Each AI fallback call is ~600-1500 input tokens (with web_search system
-# prompt and tools), and at most 5-15 calls per benchmark run.  Pacing
-# every 4-5 seconds keeps us safely under cap.
-#
-# Gemini 2.0 Flash free tier is 15 RPM (4 seconds between calls minimum).
 
 _LAST_ANTHROPIC_CALL_AT: float = 0.0
 _LAST_GEMINI_CALL_AT: float = 0.0
-_ANTHROPIC_MIN_INTERVAL_S: float = 5.0
-_GEMINI_MIN_INTERVAL_S: float = 5.0
+_ANTHROPIC_MIN_INTERVAL_S: float = 9.0   # ~6.6 req/min — safe for tight ITPM tiers
+_GEMINI_MIN_INTERVAL_S: float = 6.0      # ~10 req/min — under Gemini 15 RPM cap
 
 # When a provider just 429'd, cool off longer before hitting it again.
 _ANTHROPIC_COOLDOWN_UNTIL: float = 0.0
 _GEMINI_COOLDOWN_UNTIL: float = 0.0
+
+# After N consecutive 429s, give up on a provider for the rest of the run
+# and route all subsequent calls to the other one.  This avoids burning
+# 60+ seconds of cooldowns on a provider that's clearly out of capacity.
+_ANTHROPIC_429_STREAK: int = 0
+_GEMINI_429_STREAK: int = 0
+_GIVE_UP_AFTER_N_429S: int = 2
+
+
+def _provider_is_available(provider: str) -> bool:
+    """Returns False if a provider has exceeded the 429 streak — caller
+    should skip it and use the other provider instead."""
+    if provider == "anthropic":
+        return _ANTHROPIC_429_STREAK < _GIVE_UP_AFTER_N_429S
+    if provider == "gemini":
+        return _GEMINI_429_STREAK < _GIVE_UP_AFTER_N_429S
+    return True
 
 
 def _wait_for_rate_window(provider: str) -> None:
@@ -121,13 +131,33 @@ def _wait_for_rate_window(provider: str) -> None:
 
 
 def _mark_rate_limited(provider: str) -> None:
-    """Set a long cooldown for a provider that just 429'd."""
+    """Set a cooldown for a provider that just 429'd, and increment streak."""
     global _ANTHROPIC_COOLDOWN_UNTIL, _GEMINI_COOLDOWN_UNTIL
+    global _ANTHROPIC_429_STREAK, _GEMINI_429_STREAK
     import time as _t
     if provider == "anthropic":
-        _ANTHROPIC_COOLDOWN_UNTIL = _t.time() + 30.0  # wait 30s before next
+        _ANTHROPIC_COOLDOWN_UNTIL = _t.time() + 30.0
+        _ANTHROPIC_429_STREAK += 1
+        if _ANTHROPIC_429_STREAK >= _GIVE_UP_AFTER_N_429S:
+            log.warning("Anthropic 429'd %d times in a row — disabling for the "
+                        "rest of this run; routing all calls to Gemini.",
+                        _ANTHROPIC_429_STREAK)
     elif provider == "gemini":
         _GEMINI_COOLDOWN_UNTIL = _t.time() + 30.0
+        _GEMINI_429_STREAK += 1
+        if _GEMINI_429_STREAK >= _GIVE_UP_AFTER_N_429S:
+            log.warning("Gemini 429'd %d times in a row — disabling for the "
+                        "rest of this run; routing all calls to Anthropic.",
+                        _GEMINI_429_STREAK)
+
+
+def _mark_success(provider: str) -> None:
+    """Reset the 429 streak after a successful call."""
+    global _ANTHROPIC_429_STREAK, _GEMINI_429_STREAK
+    if provider == "anthropic":
+        _ANTHROPIC_429_STREAK = 0
+    elif provider == "gemini":
+        _GEMINI_429_STREAK = 0
 
 
 class AiFallbackExtractor(Extractor):
@@ -160,17 +190,23 @@ class AiFallbackExtractor(Extractor):
             dp_anthropic = None
             dp_gemini = None
 
-            if anthropic_client:
+            # If a provider has been disabled mid-run due to repeated 429s,
+            # skip it and route directly to the other one.  Saves ~30s per
+            # metric of pointless cooldown waiting.
+            try_anthropic = anthropic_client and _provider_is_available("anthropic")
+            try_gemini = gemini_client and _provider_is_available("gemini")
+
+            if try_anthropic:
                 dp_anthropic = self._extract_one_anthropic(anthropic_client, company, metric)
                 if dp_anthropic.ok:
+                    _mark_success("anthropic")
                     results.append(dp_anthropic)
                     continue
-                # Anthropic failed — _wait_for_rate_window handles cooldown
-                # automatically when next call happens, so no sleep here.
 
-            if gemini_client:
+            if try_gemini:
                 dp_gemini = self._extract_one_gemini(gemini_client, company, metric)
                 if dp_gemini.ok:
+                    _mark_success("gemini")
                     if dp_anthropic is not None:
                         dp_gemini.attempts = (
                             list(dp_anthropic.attempts) + list(dp_gemini.attempts)
