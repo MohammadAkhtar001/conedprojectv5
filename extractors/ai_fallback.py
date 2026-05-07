@@ -230,12 +230,19 @@ class AiFallbackExtractor(Extractor):
             description = meta["description"]
             expected_range = meta["expected_range"]
 
-        prompt = f"""Find FY2024 value of {metric} ({unit}) for US utility "{company.name}". Web search. Prefer SEC/IRS/EPA/EIA. Refuse to guess; set value=null if no credible source.
+        prompt = f"""Find FY2024 value of {metric} ({unit}) for US utility "{company.name}". Web search. Prefer SEC/IRS/EPA/EIA. If no regulator data exists, return whatever non-regulator value you find with a low confidence score — DO NOT return null just because the source isn't authoritative. Only set value=null if you genuinely found nothing.
 
 Return ONE JSON object only:
-{{"value": <number or null>, "unit": "{unit}", "year": "FY2024", "source_url": "<URL>", "source_name": "<short label>", "confidence": <0.30/0.50/0.60/0.85>, "notes": "<1 sentence>"}}
+{{"value": <number or null>, "unit": "{unit}", "year": "FY2024", "source_url": "<URL>", "source_name": "<short label>", "confidence": <0.20/0.30/0.50/0.60/0.85>, "notes": "<1 sentence>"}}
 
-Confidence: 0.85=regulator, 0.60=CSR, 0.50=survey, 0.30=news."""
+Confidence scale:
+  0.85 = regulator filing (SEC/IRS/EPA/EIA/state PUC)
+  0.60 = company CSR / sustainability report
+  0.50 = third-party survey (J.D. Power etc.)
+  0.30 = press release / news article
+  0.20 = third-party aggregator / unverified data broker (DitchCarbon, etc.) — RETURN THE VALUE, just flag it with this confidence
+
+Always cite the actual source URL you used."""
 
         attempts: list[ExtractionAttempt] = []
         text = ""
@@ -347,36 +354,54 @@ Confidence: 0.85=regulator, 0.60=CSR, 0.50=survey, 0.30=news."""
         if value is None:
             return make_failure(
                 company=company.name, metric=metric,
-                reason=parsed.get("notes") or "AI returned null (no credible source found)",
+                reason=parsed.get("notes") or "AI returned null (no source found)",
                 attempts=attempts,
             )
 
-        # Validate against rules if it's a known metric
+        # Validate against rules if it's a known metric.  Per directive:
+        # if the value falls outside the plausible range, we DO NOT
+        # silently drop it — we pass it through with very low confidence
+        # so the user sees what the AI found but knows to flag it.
+        validator_warning = None
         if meta:
             try:
                 value = validate_value(metric, float(value), unit)
             except ValidationFailure as ve:
-                return make_failure(
-                    company=company.name, metric=metric,
-                    reason=f"AI value rejected by validator: {ve.reason}",
-                    attempts=attempts,
-                    notes=f"raw AI response: value={parsed.get('value')} {unit}",
+                # Keep the raw value but mark it as suspect.
+                validator_warning = (
+                    f"⚠️ VALUE OUTSIDE PLAUSIBLE RANGE: {ve.reason}. "
+                    f"Original AI response: value={parsed.get('value')} {unit}. "
+                    f"Passed through anyway per directive — review before using."
                 )
+                try:
+                    value = float(parsed.get("value"))
+                except (TypeError, ValueError):
+                    return make_failure(
+                        company=company.name, metric=metric,
+                        reason=f"AI value not numeric: {parsed.get('value')!r}",
+                        attempts=attempts,
+                    )
 
         confidence = parsed.get("confidence")
         if not isinstance(confidence, (int, float)):
             confidence = self.base_confidence
-        confidence = max(0.30, min(0.85, float(confidence)))
+        confidence = max(0.20, min(0.85, float(confidence)))
         # Without web_search, the AI is answering from training data — cap
         # confidence at 0.45 so this never looks like a regulator-grade source.
         if not used_search:
             confidence = min(confidence, 0.45)
+        # Validator-rejected values get the lowest confidence so they
+        # always show 🚩.
+        if validator_warning is not None:
+            confidence = min(confidence, 0.20)
 
         notes_text = parsed.get("notes") or ""
         if not used_search:
             notes_text = ("[no web_search available on this model — value "
                           "from training data only, treat as low-confidence] "
                           + notes_text)
+        if validator_warning:
+            notes_text = (validator_warning + " | " + notes_text).strip(" |")
 
         return DataPoint(
             company=company.name, metric=metric,
