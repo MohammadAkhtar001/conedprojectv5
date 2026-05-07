@@ -200,25 +200,29 @@ def to_excel(
     _write_cover_sheet(cover, datapoints, ok_dps, fail_dps, companies,
                        ordered_metrics, audit_summary, insights, s)
 
-    # ── Sheet 2: Benchmark (wide, formatted) ───────────────────────────────
+    # ── Sheet 2: Where Con Edison Stands ───────────────────────────────────
+    standing_sheet = wb.create_sheet("Where Con Ed Stands")
+    _write_standing_sheet(standing_sheet, datapoints, ordered_metrics, s)
+
+    # ── Sheet 3: Benchmark (wide, formatted) ───────────────────────────────
     bench = wb.create_sheet("Benchmark")
     _write_benchmark_sheet(bench, datapoints, companies, ordered_metrics, flags, s)
 
-    # ── Sheet 3: Per metric (one labeled block per metric) ─────────────────
+    # ── Sheet 4: Per metric (one labeled block per metric) ─────────────────
     per_metric = wb.create_sheet("Per metric")
     _write_per_metric_sheet(per_metric, datapoints, companies, ordered_metrics, flags, s)
 
-    # ── Sheet 4: Failures & gaps ───────────────────────────────────────────
+    # ── Sheet 5: Failures & gaps ───────────────────────────────────────────
     if fail_dps:
         fails = wb.create_sheet("Failures & gaps")
         _write_failures_sheet(fails, fail_dps, flags, s)
 
-    # ── Sheet 5: AI Audit ─────────────────────────────────────────────────
+    # ── Sheet 6: AI Audit ─────────────────────────────────────────────────
     if audit_summary or insights:
         audit = wb.create_sheet("AI Audit")
         _write_audit_sheet(audit, audit_summary, insights, s)
 
-    # ── Sheet 6: Attempts log (hidden) ─────────────────────────────────────
+    # ── Sheet 7: Attempts log (hidden) ─────────────────────────────────────
     attempt_rows = []
     for dp in datapoints:
         for a in dp.attempts:
@@ -329,6 +333,130 @@ def _write_cover_sheet(ws, datapoints, ok_dps, fail_dps, companies,
     ws.column_dimensions["B"].width = 80
 
     # Hide gridlines for a cleaner look
+    ws.sheet_view.showGridLines = False
+
+
+def _write_standing_sheet(ws, datapoints, ordered_metrics, s):
+    """Sheet showing Con Edison's standing on each metric: rank, peer median,
+    leader, laggard, narrative.  Drives the executive 'how do we look?' read."""
+    from openpyxl.styles import Alignment
+    from pipeline.ai_layer import compute_standing
+
+    standings = compute_standing(datapoints, focus_company="Con Edison")
+
+    ws["A1"] = "Where Con Edison Stands"
+    ws["A1"].font = s["title_font"]
+    ws.row_dimensions[1].height = 28
+    ws["A2"] = ("For every metric, this sheet shows Con Edison's rank, "
+                "distance from the peer median, and who leads / lags the "
+                "peer set.")
+    ws["A2"].font = s["subtitle_font"]
+    ws.row_dimensions[2].height = 20
+    ws.merge_cells("A2:H2")
+
+    headers = ["Metric", "Verdict", "Con Ed value", "Rank", "of",
+               "Peer median", "vs Median %", "Leader (Company / value)",
+               "Laggard (Company / value)", "Narrative"]
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=4, column=col_idx, value=h)
+        cell.fill = s["header_fill"]
+        cell.font = s["header_font"]
+        cell.alignment = s["header_align"]
+        cell.border = s["border"]
+    ws.row_dimensions[4].height = 28
+
+    row = 5
+    for metric_key in ordered_metrics:
+        info = standings.get(metric_key, {})
+        meta = METRICS.get(metric_key, {})
+        label = meta.get("label", metric_key)
+        unit = meta.get("unit", "")
+        verdict = info.get("verdict", "—")
+
+        # Background color cue per verdict
+        verdict_fill = {
+            "Top performer": s["good_fill"],
+            "Above median":  s["good_fill"],
+            "Median":        s["warn_fill"],
+            "Below median":  s["warn_fill"],
+            "Lowest":        s["bad_fill"],
+            "No data":       s["info_fill"],
+        }.get(verdict)
+
+        cells_to_color = []
+        # Metric
+        c = ws.cell(row=row, column=1, value=label)
+        c.font = s["label_font"]
+        cells_to_color.append(c)
+        # Verdict
+        c = ws.cell(row=row, column=2, value=verdict)
+        c.font = s["body_font"]
+        cells_to_color.append(c)
+        # Con Ed value
+        if info.get("focus_value") is not None:
+            c = ws.cell(row=row, column=3, value=info["focus_value"])
+            c.number_format = _number_format_for(unit)
+        else:
+            c = ws.cell(row=row, column=3, value="—")
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        cells_to_color.append(c)
+        # Rank, of
+        ws.cell(row=row, column=4, value=info.get("rank") or "—")
+        ws.cell(row=row, column=5, value=info.get("of_total") or "—")
+        cells_to_color += [ws.cell(row=row, column=4),
+                           ws.cell(row=row, column=5)]
+        # Peer median
+        if info.get("peer_median") is not None:
+            c = ws.cell(row=row, column=6, value=info["peer_median"])
+            c.number_format = _number_format_for(unit)
+        else:
+            c = ws.cell(row=row, column=6, value="—")
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        cells_to_color.append(c)
+        # vs Median %
+        if info.get("vs_median_pct") is not None:
+            ws.cell(row=row, column=7, value=info["vs_median_pct"] / 100)
+            ws.cell(row=row, column=7).number_format = "+0.0%;-0.0%"
+        else:
+            ws.cell(row=row, column=7, value="—")
+        cells_to_color.append(ws.cell(row=row, column=7))
+        # Leader
+        if info.get("best"):
+            ws.cell(row=row, column=8,
+                    value=f"{info['best'][0]}: {info['best'][1]:g}")
+        else:
+            ws.cell(row=row, column=8, value="—")
+        cells_to_color.append(ws.cell(row=row, column=8))
+        # Laggard
+        if info.get("worst"):
+            ws.cell(row=row, column=9,
+                    value=f"{info['worst'][0]}: {info['worst'][1]:g}")
+        else:
+            ws.cell(row=row, column=9, value="—")
+        cells_to_color.append(ws.cell(row=row, column=9))
+        # Narrative
+        c = ws.cell(row=row, column=10, value=_sanitize_for_excel(info.get("narrative", "")))
+        c.alignment = s["body_align"]
+        c.font = s["body_font"]
+        cells_to_color.append(c)
+
+        for cc in cells_to_color:
+            cc.border = s["border"]
+            if verdict_fill is not None:
+                cc.fill = verdict_fill
+        row += 1
+
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 14
+    ws.column_dimensions["D"].width = 8
+    ws.column_dimensions["E"].width = 6
+    ws.column_dimensions["F"].width = 14
+    ws.column_dimensions["G"].width = 12
+    ws.column_dimensions["H"].width = 30
+    ws.column_dimensions["I"].width = 30
+    ws.column_dimensions["J"].width = 60
+    ws.freeze_panes = "A5"
     ws.sheet_view.showGridLines = False
 
 
@@ -472,11 +600,12 @@ def _write_per_metric_sheet(ws, datapoints, companies, ordered_metrics, flags, s
                     value=f"{description} · expected {expected} · "
                           f"{'lower is better' if lower_better else 'higher is better'}")
         c.font = s["subtitle_font"]
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
         row += 1
 
         # Column headers for this block
-        headers = ["Flag", "Company", "Value", "Unit", "Year", "Source"]
+        headers = ["Flag", "Company", "Value", "Unit", "Year",
+                   "Confidence", "Source", "Source URL"]
         for col_idx, h in enumerate(headers, 1):
             hc = ws.cell(row=row, column=col_idx, value=h)
             hc.fill = s["header_fill"]
@@ -535,14 +664,30 @@ def _write_per_metric_sheet(ws, datapoints, companies, ordered_metrics, flags, s
             # Year
             c = ws.cell(row=row, column=5, value=_sanitize_for_excel(dp.year if dp and dp.ok else "—"))
             cells.append(c)
-            # Source (or reason for failure)
+            # Confidence (always present — 0.00 for missing)
+            conf_val = dp.confidence_score if dp else 0.0
+            cc = ws.cell(row=row, column=6, value=conf_val if conf_val is not None else 0.0)
+            cc.number_format = "0.00"
+            cc.alignment = Alignment(horizontal="right", vertical="center")
+            cells.append(cc)
+            # Source name (or reason for failure)
             if dp and dp.ok:
                 source_text = (dp.source_name or "").split(" — ")[0]
             else:
                 source_text = (flag_info.get("reason") or "(see Failures sheet)")[:200]
-            c = ws.cell(row=row, column=6, value=_sanitize_for_excel(source_text))
+            c = ws.cell(row=row, column=7, value=_sanitize_for_excel(source_text))
             c.alignment = s["body_align"]
             cells.append(c)
+            # Source URL (clickable)
+            if dp and dp.ok and dp.source_url:
+                url_cell = ws.cell(row=row, column=8, value=dp.source_url)
+                url_cell.hyperlink = dp.source_url
+                url_cell.style = "Hyperlink"
+                url_cell.alignment = s["body_align"]
+            else:
+                url_cell = ws.cell(row=row, column=8, value="—")
+                url_cell.alignment = Alignment(horizontal="center")
+            cells.append(url_cell)
 
             # Apply zebra striping + borders + body font
             for cc in cells:
@@ -556,12 +701,14 @@ def _write_per_metric_sheet(ws, datapoints, companies, ordered_metrics, flags, s
         row += 1  # spacer between metrics
 
     # Column widths
-    ws.column_dimensions["A"].width = 8
-    ws.column_dimensions["B"].width = 28
-    ws.column_dimensions["C"].width = 16
-    ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 12
-    ws.column_dimensions["F"].width = 60
+    ws.column_dimensions["A"].width = 8     # Flag
+    ws.column_dimensions["B"].width = 28    # Company
+    ws.column_dimensions["C"].width = 14    # Value
+    ws.column_dimensions["D"].width = 12    # Unit
+    ws.column_dimensions["E"].width = 12    # Year
+    ws.column_dimensions["F"].width = 12    # Confidence
+    ws.column_dimensions["G"].width = 32    # Source
+    ws.column_dimensions["H"].width = 50    # URL
 
     ws.sheet_view.showGridLines = False
 
