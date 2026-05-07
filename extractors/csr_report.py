@@ -260,7 +260,7 @@ class CsrReportExtractor(Extractor):
 
         # Run each requested metric through its patterns
         for m in wanted:
-            value, snippet = self._find_metric(text, m)
+            value, snippet, page = self._find_metric(text, m)
             if value is None:
                 results.append(make_failure(
                     company=company.name, metric=m,
@@ -282,16 +282,32 @@ class CsrReportExtractor(Extractor):
                 ))
                 continue
 
+            # Build a "Check My Work" URL — appending #page=N tells PDF
+            # viewers (Chrome, Adobe, Edge) to jump directly to the page
+            # where this value was found.  Works for direct-PDF links;
+            # falls back to the bare URL if not a PDF or page is unknown.
+            url_with_page = url
+            if page is not None and url.lower().endswith(".pdf"):
+                url_with_page = f"{url}#page={page}"
+
+            page_label = f" (page {page})" if page else ""
+            attribution_note = (
+                f"📄 Found{page_label}: \"{snippet}\""
+                if snippet else
+                f"📄 Found in CSR PDF{page_label}"
+            )
+
             results.append(DataPoint(
                 company=company.name, metric=m,
                 value=round(validated, 3),
                 unit=unit,
-                year=None,  # CSRs are typically year-stamped in title; not reliably extracted
-                source_url=url,
-                source_name=f"{self.source_name} ({company.name})",
+                year=None,
+                source_url=url_with_page,
+                source_name=f"{self.source_name} ({company.name})"
+                            + (f" p.{page}" if page else ""),
                 confidence_score=self.base_confidence,
                 attempts=attempts,
-                notes=f"Matched in CSR text near: '{snippet[:120]}…'",
+                notes=attribution_note,
             ))
 
         return results
@@ -325,15 +341,49 @@ class CsrReportExtractor(Extractor):
 
     @staticmethod
     def _pdf_to_text(blob: bytes) -> str:
-        """Extract text from a PDF blob using pdfplumber."""
+        """Extract text from a PDF blob using pdfplumber.  Each page is
+        prefixed with a marker so we can later determine which page a
+        match came from.  The marker is invisible to the regex extractors
+        (it's an unusual sequence) but readable by _page_for_offset()."""
         import io
         import pdfplumber
         out = []
         with pdfplumber.open(io.BytesIO(blob)) as pdf:
-            for page in pdf.pages:
+            for i, page in enumerate(pdf.pages, 1):
                 t = page.extract_text() or ""
-                out.append(t)
+                # Marker we can scan for later when we know the match offset
+                out.append(f"\x1f__PAGE_{i}__\x1f\n{t}")
         return "\n".join(out)
+
+    @staticmethod
+    def _page_for_offset(text: str, offset: int) -> Optional[int]:
+        """Return the page number (1-indexed) where the given character
+        offset falls in text, based on \\x1f__PAGE_N__\\x1f markers."""
+        import re
+        last_page = None
+        for m in re.finditer(r"\x1f__PAGE_(\d+)__\x1f", text):
+            if m.start() > offset:
+                break
+            last_page = int(m.group(1))
+        return last_page
+
+    @staticmethod
+    def _snippet_around(text: str, offset: int, span: int = 120) -> str:
+        """Return a ~240-char snippet around an offset, with page markers
+        stripped, for use in source attribution."""
+        import re
+        start = max(0, offset - span)
+        end = min(len(text), offset + span)
+        snippet = text[start:end]
+        # Strip our internal page markers and collapse whitespace
+        snippet = re.sub(r"\x1f__PAGE_\d+__\x1f\n?", "", snippet)
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+        # Add ellipses if we trimmed
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(text):
+            snippet = snippet + "…"
+        return snippet
 
     @staticmethod
     def _find_pdf_link(html: str, base_url: str) -> Optional[str]:
@@ -367,9 +417,9 @@ class CsrReportExtractor(Extractor):
 
     # ── Pattern matching ───────────────────────────────────────────────────
 
-    def _find_metric(self, text: str, metric: str) -> tuple[Optional[float], str]:
-        """Run patterns for `metric` against `text`.  Return (value, snippet)
-        or (None, '') if nothing matches."""
+    def _find_metric(self, text: str, metric: str) -> tuple[Optional[float], str, Optional[int]]:
+        """Run patterns for `metric` against `text`.  Return
+        (value, snippet, page_number) or (None, '', None) if nothing matches."""
         patterns = PHRASE_PATTERNS.get(metric, [])
         text_lower = text.lower()
         for pattern, _ in patterns:
@@ -380,11 +430,10 @@ class CsrReportExtractor(Extractor):
                     value = _normalize_number(raw, magnitude)
                 except ValueError:
                     continue
-                snippet_start = max(0, match.start() - 30)
-                snippet_end = min(len(text), match.end() + 30)
-                snippet = text[snippet_start:snippet_end].replace("\n", " ")
-                return value, snippet
-        return None, ""
+                snippet = self._snippet_around(text, match.start())
+                page = self._page_for_offset(text, match.start())
+                return value, snippet, page
+        return None, "", None
 
 
 for m in CsrReportExtractor.supplies_metrics:
