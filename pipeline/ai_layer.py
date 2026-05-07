@@ -561,11 +561,32 @@ def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]
         c = dp.confidence_score or 0
         notes_lower = (dp.notes or "").lower()
 
-        # Press-release tier — we distrust this enough to flag
-        if c < 0.30:
+        # Validator-warning case: value was returned but flagged as outside
+        # plausible range.  Always 🚩 with a clear explanation.
+        if "value outside plausible range" in notes_lower:
             flags[key] = {
                 "flag": "🚩",
-                "reason": f"very low confidence ({c:.2f}) — press release / news only",
+                "reason": (f"Value passed through but is outside plausible range "
+                           f"for this metric — review before using. "
+                           f"Confidence {c:.2f}."),
+            }
+            continue
+
+        # Untrusted source tier (DitchCarbon, data brokers, etc.)
+        if c <= 0.25:
+            flags[key] = {
+                "flag": "🚩",
+                "reason": (f"Very low confidence ({c:.2f}) — value from "
+                           f"unverified third-party aggregator or data broker. "
+                           f"Cross-check before using."),
+            }
+            continue
+
+        # Press-release tier — distrust enough to flag
+        if c <= 0.35:
+            flags[key] = {
+                "flag": "🚩",
+                "reason": f"low confidence ({c:.2f}) — press release / news only, cross-check before using",
             }
             continue
 
