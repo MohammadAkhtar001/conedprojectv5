@@ -46,6 +46,42 @@ METRICS: dict[str, dict[str, Any]] = {
         "expected_range": "50 – 200 min/yr",
         "description": "System Average Interruption Duration Index.",
     },
+    "transmission_line_miles": {
+        "label": "Transmission Line Miles",
+        "unit": "miles",
+        "category": "operations",
+        "lower_is_better": False,
+        "plausible_min": 50.0,
+        "plausible_max": 100000.0,
+        "expected_range": "500 – 30,000 miles for large IOUs",
+        "description": ("Total miles of transmission lines (≥69 kV) operated. "
+                        "Sourced from FERC Form 1 Schedule 422 'Transmission "
+                        "Line Statistics'. Useful for size-normalization."),
+    },
+    "rate_base": {
+        "label": "Rate Base (Net Plant in Service)",
+        "unit": "$B",
+        "category": "operations",
+        "lower_is_better": False,
+        "plausible_min": 0.5,
+        "plausible_max": 100.0,
+        "expected_range": "$3 – $50B for large IOUs",
+        "description": ("Net electric plant in service from FERC Form 1, "
+                        "Schedule 200 'Comparative Balance Sheet'. The "
+                        "asset base on which utilities earn allowed return."),
+    },
+    "operating_expenses_ferc": {
+        "label": "Operating Expenses (FERC)",
+        "unit": "$B",
+        "category": "operations",
+        "lower_is_better": False,
+        "plausible_min": 0.1,
+        "plausible_max": 50.0,
+        "expected_range": "$1 – $20B for large IOUs",
+        "description": ("Total electric operating expenses from FERC Form 1, "
+                        "Schedule 320 'Electric Operation and Maintenance "
+                        "Expenses'. More granular than 10-K opex."),
+    },
     "customer_satisfaction": {
         "label": "Customer Satisfaction Score",
         "unit": "/100",
@@ -89,16 +125,20 @@ METRICS: dict[str, dict[str, Any]] = {
                         "Excludes operating-budget giving."),
     },
     "charitable_giving": {
-        "label": "Total Charitable Giving",
+        "label": "Charitable Giving (Foundation 990)",
         "unit": "$M",
         "category": "philanthropy",
         "lower_is_better": False,
         "plausible_min": 0.01,
         "plausible_max": 500.0,
-        "expected_range": "$5M – $100M for large US utilities",
-        "description": ("Total corporate giving — foundation grants paid PLUS "
-                        "direct corporate contributions PLUS in-kind. Combines "
-                        "990-PF data with CSR disclosure when available."),
+        "expected_range": "$0.5M – $20M for the foundation slice only",
+        "description": ("⚠️ FOUNDATION-PAID GIVING ONLY — pulled from IRS 990-PF "
+                        "filings via ProPublica. This is the formal grants-paid line "
+                        "from the company's 501(c)(3) foundation, NOT total corporate "
+                        "philanthropy. Total corporate giving (which includes direct "
+                        "operating-budget contributions, energy assistance, community "
+                        "investment, and in-kind) is typically 100×-1000× larger. "
+                        "For total giving, use 'community_investment' instead."),
     },
     "community_investment": {
         "label": "Community Investment",
