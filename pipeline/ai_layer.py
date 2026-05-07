@@ -1,50 +1,116 @@
 """
 Optional AI-driven verification + insights layer.
 
-If ANTHROPIC_API_KEY is set, after the pipeline produces DataPoints we
-ask Claude to:
-  1. Audit the table for outliers, scale errors, peer inconsistencies
-     (with structural context — integrated generators legitimately emit
-     ~10× more Scope 1 CO₂ than pure distributors).
-  2. Generate strategic insights for a Community Partnerships team
-     reading the benchmark.
+Supports two providers:
+  - Anthropic Claude (paid, with web_search support for AI fallback)
+  - Google Gemini (free tier 1500 req/day, no web_search)
 
-This layer NEVER modifies values.  If verification flags an outlier, it
-is reported in the audit text — the underlying DataPoint is unchanged.
-The strict "no fallback" rule means we don't let the AI invent or
-substitute values; it only annotates.
+When BOTH keys are set, verify/insights/quality_scan can run twice — once
+per provider — so the user gets two parallel views and can compare.
 
-If ANTHROPIC_API_KEY is not set, both functions return None and the
-pipeline still produces complete data and exports.
+If neither key is set, the AI layer is fully disabled and the pipeline
+still produces complete data and exports.
 """
 
 from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
+from typing import Optional, Literal
 
 from .models import DataPoint, METRICS
 
 log = logging.getLogger("ai_layer")
 
+Provider = Literal["anthropic", "gemini"]
 
-def _client():
+
+# ── Provider clients ───────────────────────────────────────────────────────
+
+
+def _anthropic_client():
+    """Return an Anthropic client, or None if key missing or SDK unavailable."""
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not key:
+    if not key or key.startswith("sk-ant-...") or len(key) < 20:
         return None
     try:
         from anthropic import Anthropic
         return Anthropic(api_key=key)
     except ImportError:
-        log.warning("anthropic package not installed; AI layer disabled")
+        log.warning("anthropic package not installed; Anthropic backend disabled")
         return None
 
 
-def verify(datapoints: list[DataPoint]) -> Optional[str]:
-    """Returns an audit summary string, or None if AI layer disabled."""
-    client = _client()
-    if not client:
+def _gemini_client():
+    """Return a Gemini client, or None if key missing or SDK unavailable."""
+    key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not key or len(key) < 20:
+        return None
+    try:
+        from google import genai
+        return genai.Client(api_key=key)
+    except ImportError:
+        log.warning("google-genai not installed; Gemini backend disabled")
+        return None
+
+
+# Backwards compat: existing call sites use _client() — keep it pointing to
+# Anthropic so nothing breaks if I missed a spot.
+def _client():
+    return _anthropic_client()
+
+
+def available_providers() -> list[Provider]:
+    """Return list of providers with a working configured key."""
+    out: list[Provider] = []
+    if _anthropic_client():
+        out.append("anthropic")
+    if _gemini_client():
+        out.append("gemini")
+    return out
+
+
+def _call_llm(provider: Provider, prompt: str, *, max_tokens: int = 2000) -> str:
+    """Make a single text-completion call to the given provider.  Returns
+    the response text, or raises on failure (caller handles)."""
+    if provider == "anthropic":
+        client = _anthropic_client()
+        if client is None:
+            raise RuntimeError("Anthropic backend not configured")
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "".join(
+            b.text for b in msg.content if getattr(b, "type", None) == "text"
+        ).strip()
+
+    elif provider == "gemini":
+        client = _gemini_client()
+        if client is None:
+            raise RuntimeError("Gemini backend not configured")
+        # Use the most capable free-tier model.  gemini-2.0-flash is the
+        # current default; gemini-2.5-flash is also free with similar limits.
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+        return (resp.text or "").strip()
+
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+def verify(
+    datapoints: list[DataPoint],
+    *,
+    provider: Provider = "anthropic",
+) -> Optional[str]:
+    """Returns an audit summary string from the given provider, or None
+    if that provider isn't configured."""
+    if provider == "anthropic" and not _anthropic_client():
+        return None
+    if provider == "gemini" and not _gemini_client():
         return None
 
     rows = []
@@ -77,24 +143,26 @@ Compiled values:
 Structural context that is NOT an error:
 - Integrated generators (Duke, Southern, Dominion) legitimately emit ~10× more Scope 1 CO₂ than pure distributors (Con Edison, Eversource, National Grid).
 - Charitable Giving and Foundation Assets correlate with company size; small absolute giving from a small utility is not an outlier.
+- Charitable Giving from ProPublica is the FOUNDATION 990-PF slice only — does not include direct corporate giving or energy assistance, so small numbers (e.g. $0.03M) are real for that scope.
 
 Write 2–4 sentences summarizing data quality, then list any specific values you'd flag for review with a one-line reason each. Do not invent or suggest replacement values."""
 
     try:
-        msg = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(b.text for b in msg.content if b.type == "text").strip()
+        return _call_llm(provider, prompt, max_tokens=2000)
     except Exception as e:
-        log.warning("AI verify failed: %s", e)
-        return f"(AI verification failed: {e})"
+        log.warning("AI verify (%s) failed: %s", provider, e)
+        return f"(AI verification failed [{provider}]: {e})"
 
 
-def generate_insights(datapoints: list[DataPoint], audit: Optional[str] = None) -> Optional[str]:
-    client = _client()
-    if not client:
+def generate_insights(
+    datapoints: list[DataPoint],
+    audit: Optional[str] = None,
+    *,
+    provider: Provider = "anthropic",
+) -> Optional[str]:
+    if provider == "anthropic" and not _anthropic_client():
+        return None
+    if provider == "gemini" and not _gemini_client():
         return None
 
     summary_rows = []
@@ -126,15 +194,10 @@ Benchmark:
 Return a markdown bullet list. Use **bold** for headlines."""
 
     try:
-        msg = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(b.text for b in msg.content if b.type == "text").strip()
+        return _call_llm(provider, prompt, max_tokens=2000)
     except Exception as e:
-        log.warning("AI insights failed: %s", e)
-        return f"(AI insights failed: {e})"
+        log.warning("AI insights (%s) failed: %s", provider, e)
+        return f"(AI insights failed [{provider}]: {e})"
 
 
 # ── Quality scan: per-value flags ────────────────────────────────────────────
@@ -432,11 +495,36 @@ def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]
                                "Add one to extractors/csr_report.py CSR_URL_HINTS, "
                                "or enable AI fallback to find values via web search."),
                 }
-            elif "ai fallback api call failed" in notes_text:
-                flags[key] = {
-                    "flag": "🚩",
-                    "reason": "AI fallback errored — see Attempts log for the API error",
-                }
+            elif "ai fallback api call failed" in notes_text or "ai fallback api call failed" in reason_text:
+                # Pull the actual API error out of the notes string.
+                # Notes look like: "AiFallback: AI fallback API call failed: <real error>"
+                actual_error = ""
+                for source_str in (notes_text, reason_text):
+                    if "ai fallback api call failed:" in source_str:
+                        idx = source_str.index("ai fallback api call failed:")
+                        actual_error = source_str[idx + len("ai fallback api call failed:"):].strip()
+                        # Truncate long error messages
+                        actual_error = actual_error.split(" | ")[0][:240]
+                        break
+                if "model:" in actual_error and "not_found" in actual_error:
+                    msg = (f"AI fallback failed — the model name in the code "
+                           f"isn't recognized by your Anthropic account. "
+                           f"Update model strings in pipeline/ai_layer.py and "
+                           f"extractors/ai_fallback.py. Raw error: {actual_error}")
+                elif "credit balance" in actual_error or "billing" in actual_error:
+                    msg = ("AI fallback failed — Anthropic API has $0 credit. "
+                           "Add billing at console.anthropic.com or remove "
+                           "ANTHROPIC_API_KEY from secrets.")
+                elif "invalid x-api-key" in actual_error or "401" in actual_error:
+                    msg = ("AI fallback failed — invalid API key. Generate a "
+                           "fresh one at console.anthropic.com/settings/keys "
+                           "and update Streamlit secrets.")
+                elif "rate" in actual_error and "limit" in actual_error:
+                    msg = "AI fallback failed — hit Anthropic rate limit. Wait a minute and re-run."
+                else:
+                    msg = (f"AI fallback failed: "
+                           f"{actual_error or 'see Attempts log for full error'}")
+                flags[key] = {"flag": "🚩", "reason": msg}
             else:
                 # Generic failure — the structured extractor was tried and
                 # came back empty. Probably retrievable with a different
