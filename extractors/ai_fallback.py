@@ -79,8 +79,12 @@ def _client():
 
 _LAST_ANTHROPIC_CALL_AT: float = 0.0
 _LAST_GEMINI_CALL_AT: float = 0.0
-_ANTHROPIC_MIN_INTERVAL_S: float = 9.0   # ~6.6 req/min — safe for tight ITPM tiers
-_GEMINI_MIN_INTERVAL_S: float = 6.0      # ~10 req/min — under Gemini 15 RPM cap
+# User has 50 RPM on Sonnet/Haiku/Opus.  Haiku has 50K input tokens/min.
+# Each fallback prompt is ~120 input tokens; with web_search adding ~2-3K
+# tokens of search context, ~16-20 calls/min stays under the ITPM cap.
+# 4-second pacing = ~15 calls/min, well-spaced.
+_ANTHROPIC_MIN_INTERVAL_S: float = 4.0
+_GEMINI_MIN_INTERVAL_S: float = 6.0      # Gemini free tier: 15 RPM
 
 # When a provider just 429'd, cool off longer before hitting it again.
 _ANTHROPIC_COOLDOWN_UNTIL: float = 0.0
