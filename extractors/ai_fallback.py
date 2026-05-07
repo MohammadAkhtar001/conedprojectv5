@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Iterable, Optional
 
 from pipeline.models import (
@@ -98,25 +99,61 @@ class AiFallbackExtractor(Extractor):
 
         results = []
         for metric in metrics:
-            # Try Anthropic first (it has web_search), fall back to Gemini
-            dp = None
+            dp_anthropic = None
+            dp_gemini = None
+
             if anthropic_client:
-                dp = self._extract_one_anthropic(anthropic_client, company, metric)
-                if dp.ok:
-                    results.append(dp)
+                dp_anthropic = self._extract_one_anthropic(anthropic_client, company, metric)
+                if dp_anthropic.ok:
+                    results.append(dp_anthropic)
                     continue
+                # Small delay after Anthropic call to avoid rate-limit walls
+                # when there are many (company × metric) pairs to process.
+                time.sleep(1.5)
+
             if gemini_client:
-                dp_g = self._extract_one_gemini(gemini_client, company, metric)
-                if dp_g.ok:
-                    results.append(dp_g)
+                dp_gemini = self._extract_one_gemini(gemini_client, company, metric)
+                if dp_gemini.ok:
+                    # Merge in Anthropic's failed attempts so the audit trail
+                    # is complete (the user sees BOTH providers were tried).
+                    if dp_anthropic is not None:
+                        dp_gemini.attempts = (
+                            list(dp_anthropic.attempts) + list(dp_gemini.attempts)
+                        )
+                        prefix = (f"Recovered via Gemini after Anthropic failed. "
+                                  f"Anthropic error: "
+                                  f"{(dp_anthropic.error or {}).get('reason', '')[:100]}. ")
+                        dp_gemini.notes = (prefix + (dp_gemini.notes or "")).strip()
+                    results.append(dp_gemini)
                     continue
-                # If we have an earlier Anthropic failure, attach Gemini's
-                # attempts to it for the audit trail
-                if dp is not None:
-                    dp.attempts = dp.attempts + dp_g.attempts
-            results.append(dp if dp is not None else (dp_g if gemini_client else None))
-        # Defensive: filter Nones (shouldn't happen but be safe)
-        return [r for r in results if r is not None]
+
+            # Neither provider produced a valid value.  Build a combined
+            # failure DataPoint that surfaces BOTH provider errors so the
+            # user can diagnose without checking the attempts log.
+            combined_attempts = []
+            reasons = []
+            for label, dp in [("Anthropic", dp_anthropic), ("Gemini", dp_gemini)]:
+                if dp is None:
+                    continue
+                combined_attempts.extend(dp.attempts)
+                reason = (dp.error or {}).get("reason", "(no reason)")[:160]
+                reasons.append(f"{label}: {reason}")
+
+            if not reasons:
+                # Should not reach here (we already returned early if no
+                # clients), but be defensive.
+                results.append(make_failure(
+                    company=company.name, metric=metric,
+                    reason="AI fallback unavailable (no providers configured)",
+                    attempts=[],
+                ))
+            else:
+                results.append(make_failure(
+                    company=company.name, metric=metric,
+                    reason=f"AI fallback failed across all providers — {' | '.join(reasons)}",
+                    attempts=combined_attempts,
+                ))
+        return results
 
     def _extract_one_anthropic(self, client, company: Company, metric: str) -> DataPoint:
         return self._extract_one(client, company, metric, provider="anthropic")
