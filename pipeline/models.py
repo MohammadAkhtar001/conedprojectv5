@@ -178,14 +178,26 @@ METRICS: dict[str, dict[str, Any]] = {
 
 
 # ── Confidence scores by source kind ─────────────────────────────────────────
+# Explicit rules (per project-leader directive):
+#   1. Government / regulator-of-record sources score highest (0.85–0.95).
+#   2. Cross-source agreement BOOSTS confidence (handled in
+#      pipeline.ai_layer.apply_cross_source_bonus — when two independent
+#      sources return values within 10%, both confidence scores rise by 0.05).
+#   3. Missing data scores ZERO — explicitly, not None — so it sorts
+#      correctly in tables and Excel.
+#   4. AI / web-search fallback caps at 0.85 even with web search; without
+#      search it caps at 0.45 (training-data-only mode).
 CONFIDENCE = {
-    "sec_xbrl_exact": 0.95,
-    "gov_dataset_exact": 0.95,
-    "propublica_990": 0.85,
-    "gov_dataset_derived": 0.85,
-    "csr_report": 0.60,
-    "third_party_survey": 0.50,
-    "press_news": 0.30,
+    "sec_xbrl_exact":      0.95,   # SEC EDGAR XBRL company-facts (regulator)
+    "gov_dataset_exact":   0.95,   # EPA eGRID, EIA Form 861 (regulator)
+    "propublica_990":      0.85,   # IRS 990-PF via ProPublica (regulator)
+    "gov_dataset_derived": 0.85,   # Computed from regulator data
+    "csr_report":          0.60,   # Company-disclosed CSR PDF
+    "third_party_survey":  0.50,   # J.D. Power, similar
+    "ai_with_search":      0.65,   # AI fallback with web search (default)
+    "ai_no_search":        0.40,   # AI fallback without search (training-only)
+    "press_news":          0.30,   # Press release / news
+    "missing":             0.00,   # No value retrieved — explicit zero
 }
 
 
@@ -282,7 +294,7 @@ def make_failure(
         year=None,
         source_url=None,
         source_name=None,
-        confidence_score=None,
+        confidence_score=0.0,   # explicit zero per directive (missing = 0)
         attempts=attempts,
         error={
             "reason": reason,
