@@ -98,7 +98,7 @@ class AiFallbackExtractor(Extractor):
             ) for m in metrics]
 
         results = []
-        for metric in metrics:
+        for i, metric in enumerate(metrics):
             dp_anthropic = None
             dp_gemini = None
 
@@ -106,16 +106,24 @@ class AiFallbackExtractor(Extractor):
                 dp_anthropic = self._extract_one_anthropic(anthropic_client, company, metric)
                 if dp_anthropic.ok:
                     results.append(dp_anthropic)
+                    # Pace successful Anthropic calls — keeps us under the
+                    # token-rate limit when there are many fallbacks.
+                    time.sleep(2.0)
                     continue
-                # Small delay after Anthropic call to avoid rate-limit walls
-                # when there are many (company × metric) pairs to process.
-                time.sleep(1.5)
+
+                # Anthropic failed.  If it was a rate limit, the retry
+                # logic already backed off; skip the additional pace delay
+                # and jump to Gemini immediately.
+                anthropic_reason = (dp_anthropic.error or {}).get("reason", "").lower()
+                anthropic_was_rate_limited = (
+                    "429" in anthropic_reason or "rate" in anthropic_reason
+                    or "exceed" in anthropic_reason)
+                if not anthropic_was_rate_limited:
+                    time.sleep(0.5)
 
             if gemini_client:
                 dp_gemini = self._extract_one_gemini(gemini_client, company, metric)
                 if dp_gemini.ok:
-                    # Merge in Anthropic's failed attempts so the audit trail
-                    # is complete (the user sees BOTH providers were tried).
                     if dp_anthropic is not None:
                         dp_gemini.attempts = (
                             list(dp_anthropic.attempts) + list(dp_gemini.attempts)
@@ -125,7 +133,12 @@ class AiFallbackExtractor(Extractor):
                                   f"{(dp_anthropic.error or {}).get('reason', '')[:100]}. ")
                         dp_gemini.notes = (prefix + (dp_gemini.notes or "")).strip()
                     results.append(dp_gemini)
+                    # Gemini free tier is ~15 req/min — pace at 4s to stay safe
+                    time.sleep(4.0)
                     continue
+                # Gemini also failed; pace before next loop iteration to
+                # avoid hammering both providers
+                time.sleep(2.0)
 
             # Neither provider produced a valid value.  Build a combined
             # failure DataPoint that surfaces BOTH provider errors so the
@@ -175,35 +188,12 @@ class AiFallbackExtractor(Extractor):
             description = meta["description"]
             expected_range = meta["expected_range"]
 
-        prompt = f"""You are a utility-industry data analyst. Find the most recent (FY2024 or FY2025) value of a single metric for one US electric/gas utility.
+        prompt = f"""Find FY2024 value of {metric} ({unit}) for US utility "{company.name}". Web search. Prefer SEC/IRS/EPA/EIA. Refuse to guess; set value=null if no credible source.
 
-Company: **{company.name}**
-{f'Aliases / additional context: {", ".join(company.aliases)}' if company.aliases else ''}
-{company.notes if company.notes else ''}
+Return ONE JSON object only:
+{{"value": <number or null>, "unit": "{unit}", "year": "FY2024", "source_url": "<URL>", "source_name": "<short label>", "confidence": <0.30/0.50/0.60/0.85>, "notes": "<1 sentence>"}}
 
-Metric: **{metric}**
-Unit: {unit}
-What it means: {description}
-Expected range: {expected_range}
-
-Search the web. Prefer government / regulator sources (SEC EDGAR, IRS 990-PF, EPA eGRID, EIA, state PUC filings). Fall back to corporate sustainability reports, then to reputable news only as a last resort.
-
-Hard rules:
-- Return a single JSON object — no prose, no markdown.
-- If you cannot find a credible source for this specific value, set "value" to null. Do NOT guess.
-- Cite the actual source URL you used.
-- "confidence" should be 0.85 if from a regulator filing, 0.60 if from a CSR report, 0.50 if from a third-party survey, 0.30 if from a press release / news.
-
-Output schema:
-{{
-  "value": <number or null>,
-  "unit": "{unit}",
-  "year": "<e.g. FY2024 or null>",
-  "source_url": "<URL or null>",
-  "source_name": "<short label, e.g. 'SEC 10-K FY2024' or null>",
-  "confidence": <0.30, 0.50, 0.60, or 0.85>,
-  "notes": "<one sentence explaining what you found, or why null>"
-}}"""
+Confidence: 0.85=regulator, 0.60=CSR, 0.50=survey, 0.30=news."""
 
         attempts: list[ExtractionAttempt] = []
         text = ""
@@ -211,28 +201,48 @@ Output schema:
         provider_label = "Claude" if provider == "anthropic" else "Gemini"
         endpoint_url = (f"anthropic://messages" if provider == "anthropic"
                         else "gemini://generate_content")
+
+        def _is_rate_limit_error(err) -> bool:
+            s = str(err).lower()
+            return ("429" in s or "rate_limit" in s or "rate limit" in s
+                    or "resource_exhausted" in s or "quota" in s)
+
+        def _call_with_retry(do_call, max_retries: int = 1):
+            """Call do_call(), retry once after exponential backoff on 429."""
+            for attempt_num in range(max_retries + 1):
+                try:
+                    return do_call()
+                except Exception as e:
+                    if _is_rate_limit_error(e) and attempt_num < max_retries:
+                        wait = 8 * (attempt_num + 1)  # 8s, then 16s
+                        log.info("Rate-limited on %s; backing off %ds", provider_label, wait)
+                        time.sleep(wait)
+                        continue
+                    raise
+
         try:
             if provider == "anthropic":
                 # Try with web_search first; fall back to no-tools mode if
                 # the model rejects it.
                 try:
-                    msg = client.messages.create(
-                        model="claude-sonnet-4-6",
-                        max_tokens=2000,
+                    msg = _call_with_retry(lambda: client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=1500,
                         messages=[{"role": "user", "content": prompt}],
                         tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                    )
+                    ))
                     used_search = True
                 except Exception as search_err:
                     err_str = str(search_err).lower()
                     if ("tool" in err_str or "web_search" in err_str
-                            or "not supported" in err_str or "400" in err_str):
+                            or "not supported" in err_str
+                            or ("400" in err_str and "429" not in err_str)):
                         log.info("web_search not supported; retrying without tools")
-                        msg = client.messages.create(
-                            model="claude-sonnet-4-6",
-                            max_tokens=2000,
+                        msg = _call_with_retry(lambda: client.messages.create(
+                            model="claude-haiku-4-5-20251001",
+                            max_tokens=1500,
                             messages=[{"role": "user", "content": prompt}],
-                        )
+                        ))
                     else:
                         raise
                 text = "".join(
@@ -241,10 +251,10 @@ Output schema:
             elif provider == "gemini":
                 # Gemini free tier has no web_search; values come from
                 # training data only.  Cap confidence accordingly later.
-                resp = client.models.generate_content(
+                resp = _call_with_retry(lambda: client.models.generate_content(
                     model="gemini-2.0-flash",
                     contents=prompt,
-                )
+                ))
                 text = (resp.text or "")
                 used_search = False
 
