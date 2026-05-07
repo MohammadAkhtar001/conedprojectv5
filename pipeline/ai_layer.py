@@ -495,6 +495,21 @@ def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]
                                "Add one to extractors/csr_report.py CSR_URL_HINTS, "
                                "or enable AI fallback to find values via web search."),
                 }
+            elif ("ai fallback failed across all providers" in reason_text
+                  or "ai fallback failed across all providers" in notes_text):
+                # Both Anthropic and Gemini were tried and both failed.
+                # Show the combined reason so the user sees which provider
+                # said what.
+                combined = reason_text if "all providers" in reason_text else notes_text
+                # Strip the lead-in
+                idx = combined.lower().find("ai fallback failed across all providers")
+                detail = combined[idx:].split("—", 1)[-1].strip() if idx >= 0 else combined
+                flags[key] = {
+                    "flag": "🚩",
+                    "reason": (f"Both AI providers failed — {detail[:250]}. "
+                               "If only Anthropic was tried, set GOOGLE_API_KEY "
+                               "in Streamlit secrets to add a free Gemini fallback."),
+                }
             elif "ai fallback api call failed" in notes_text or "ai fallback api call failed" in reason_text:
                 # Pull the actual API error out of the notes string.
                 # Notes look like: "AiFallback: AI fallback API call failed: <real error>"
@@ -506,24 +521,31 @@ def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]
                         # Truncate long error messages
                         actual_error = actual_error.split(" | ")[0][:240]
                         break
+                # Detect which provider this was (look for [Claude] or [Gemini]
+                # in the source_name or attempts)
+                provider_label = "Anthropic"
+                if "[gemini]" in (notes_text + reason_text):
+                    provider_label = "Gemini"
                 if "model:" in actual_error and "not_found" in actual_error:
-                    msg = (f"AI fallback failed — the model name in the code "
-                           f"isn't recognized by your Anthropic account. "
-                           f"Update model strings in pipeline/ai_layer.py and "
-                           f"extractors/ai_fallback.py. Raw error: {actual_error}")
+                    msg = (f"{provider_label} failed — model name not recognized. "
+                           f"Raw error: {actual_error}")
                 elif "credit balance" in actual_error or "billing" in actual_error:
-                    msg = ("AI fallback failed — Anthropic API has $0 credit. "
-                           "Add billing at console.anthropic.com or remove "
-                           "ANTHROPIC_API_KEY from secrets.")
+                    msg = (f"{provider_label} failed — API credit is $0. "
+                           "Add billing or set GOOGLE_API_KEY for free Gemini fallback.")
                 elif "invalid x-api-key" in actual_error or "401" in actual_error:
-                    msg = ("AI fallback failed — invalid API key. Generate a "
-                           "fresh one at console.anthropic.com/settings/keys "
-                           "and update Streamlit secrets.")
+                    msg = (f"{provider_label} failed — invalid API key. Generate "
+                           "a fresh one and update Streamlit secrets.")
                 elif "rate" in actual_error and "limit" in actual_error:
-                    msg = "AI fallback failed — hit Anthropic rate limit. Wait a minute and re-run."
+                    msg = (f"{provider_label} failed — hit rate limit. "
+                           "Wait a minute and re-run, OR set GOOGLE_API_KEY in "
+                           "Streamlit secrets so the tool can fall through to "
+                           "Gemini's free tier (1500 req/day) when Anthropic "
+                           "rate-limits.")
+                elif "quota" in actual_error.lower():
+                    msg = (f"{provider_label} failed — daily quota exhausted. "
+                           "Add the other provider's key for redundancy.")
                 else:
-                    msg = (f"AI fallback failed: "
-                           f"{actual_error or 'see Attempts log for full error'}")
+                    msg = f"{provider_label} failed: {actual_error or '(unknown error)'}"
                 flags[key] = {"flag": "🚩", "reason": msg}
             else:
                 # Generic failure — the structured extractor was tried and
