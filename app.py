@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 # ── Path bootstrap (Streamlit Cloud sometimes runs from a different CWD) ────
 # Make sure the directory containing this file is on sys.path so the
@@ -934,19 +935,36 @@ with st.sidebar:
     metrics = selected_metrics + custom_metrics
 
     st.divider()
-    has_known_key = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    has_gemini = bool(os.environ.get("GOOGLE_API_KEY", "").strip())
+    has_any_ai = has_anthropic or has_gemini
+
+    # Build a help string explaining what's configured
+    ai_status_lines = []
+    if has_anthropic:
+        ai_status_lines.append("✅ Anthropic Claude (paid)")
+    else:
+        ai_status_lines.append("⚪ Anthropic Claude — set `ANTHROPIC_API_KEY` to enable")
+    if has_gemini:
+        ai_status_lines.append("✅ Google Gemini (free tier)")
+    else:
+        ai_status_lines.append("⚪ Google Gemini — set `GOOGLE_API_KEY` to enable (free)")
+
     use_ai = st.checkbox(
         "Use AI fallback + insights",
-        value=has_known_key,
-        disabled=not has_known_key,
-        help=("Requires ANTHROPIC_API_KEY in Streamlit secrets. "
-              "When enabled: custom companies / metrics become possible, and "
-              "structured-extractor failures get one more shot via Claude+web_search.")
-        if has_known_key else
-        "Set ANTHROPIC_API_KEY in Streamlit secrets to enable this.",
+        value=has_any_ai,
+        disabled=not has_any_ai,
+        help=(
+            "AI is used for: (1) finding values for custom companies / "
+            "metrics that don't match the registry, (2) the audit and "
+            "insights tabs.\n\n"
+            "When BOTH keys are set, the app runs both AIs and shows their "
+            "analyses in separate sub-tabs so you can compare."
+        ),
     )
-    if not has_known_key:
-        st.caption("ℹ️ AI features are disabled — `ANTHROPIC_API_KEY` is not set.")
+    st.caption("AI providers status:")
+    for line in ai_status_lines:
+        st.caption(line)
 
     # Smarter per-entry feedback: classify each custom entry.
     # - Custom company resolves via registry fuzzy match → no AI needed
@@ -1009,15 +1027,30 @@ if run_btn:
     apply_cross_source_bonus(datapoints)
     st.session_state["datapoints"] = datapoints
 
-    audit_text = None
-    insights_text = None
+    # Detect which AI providers are configured.  The two are independent —
+    # neither, either, or both can be set.  When both, we run both in
+    # parallel and show separate tabs for each.
+    from pipeline.ai_layer import available_providers
+    providers = available_providers() if use_ai else []
+
+    audit_by_provider: dict[str, Optional[str]] = {}
+    insights_by_provider: dict[str, Optional[str]] = {}
     flags = None
-    if use_ai:
-        with st.spinner("AI verification + quality scan…"):
-            audit_text = verify(datapoints)
+
+    if use_ai and providers:
+        with st.spinner(f"AI verification ({', '.join(providers)})…"):
+            for p in providers:
+                audit_by_provider[p] = verify(datapoints, provider=p)
+            # Quality-scan flags use Anthropic if available, else Gemini.
+            # We don't run both for flags because the merged_flags function
+            # combines AI output with rule-based logic and we want one source
+            # of truth for the table-cell flag.
             flags = merged_flags(datapoints)
-        with st.spinner("Generating insights…"):
-            insights_text = generate_insights(datapoints, audit_text)
+        with st.spinner(f"Generating insights ({', '.join(providers)})…"):
+            for p in providers:
+                insights_by_provider[p] = generate_insights(
+                    datapoints, audit_by_provider.get(p), provider=p
+                )
     else:
         from pipeline.ai_layer import rule_based_flags
         flags = rule_based_flags(datapoints)
@@ -1026,8 +1059,18 @@ if run_btn:
     # always available regardless of AI status.
     standings = compute_standing(datapoints, focus_company="Con Edison")
 
-    st.session_state["audit"] = audit_text
-    st.session_state["insights"] = insights_text
+    # Backwards-compat: keep "audit" / "insights" keys pointing at whichever
+    # provider was used (Anthropic preferred), so other parts of the app
+    # (Excel export, etc.) still work.
+    st.session_state["audit"] = (
+        audit_by_provider.get("anthropic") or audit_by_provider.get("gemini")
+    )
+    st.session_state["insights"] = (
+        insights_by_provider.get("anthropic") or insights_by_provider.get("gemini")
+    )
+    st.session_state["audit_by_provider"] = audit_by_provider
+    st.session_state["insights_by_provider"] = insights_by_provider
+    st.session_state["providers_used"] = providers
     st.session_state["flags"] = flags
     st.session_state["standings"] = standings
 
@@ -1050,9 +1093,9 @@ if "datapoints" in st.session_state:
     c3.metric("Failed (null)", n_fail)
     c4.metric("Avg confidence", f"{avg_conf:.2f}" if avg_conf else "—")
 
-    (tab_standing, tab_table, tab_charts, tab_failures, tab_audit,
+    (tab_table, tab_standing, tab_charts, tab_failures, tab_audit,
      tab_copilot_prompt, tab_recreate_prompt, tab_export) = st.tabs([
-        "🎯 Where Con Ed Stands", "Benchmark", "Charts", "Failures",
+        "Benchmark", "🎯 Where Con Ed Stands", "Charts", "Failures",
         "AI Audit & Insights", "📋 Copilot prompt",
         "🛠️ Recreation prompt", "Export",
     ])
@@ -1318,20 +1361,64 @@ if "datapoints" in st.session_state:
 
     # ── AI Audit & Insights tab ─────────────────────────────────────────────
     with tab_audit:
-        a = st.session_state.get("audit")
-        i = st.session_state.get("insights")
-        if not (a or i):
+        audit_by_provider = st.session_state.get("audit_by_provider") or {}
+        insights_by_provider = st.session_state.get("insights_by_provider") or {}
+        providers_used = st.session_state.get("providers_used") or []
+
+        if not providers_used:
             st.info(
-                "AI verification + insights are off, or `ANTHROPIC_API_KEY` is "
-                "not set / out of credit. Run with the AI checkbox enabled "
-                "and a valid API key to populate this tab."
+                "AI verification + insights are off, or no AI API key is set "
+                "/ working. To populate this tab:\n\n"
+                "- **Anthropic Claude** (paid, higher quality): set "
+                "`ANTHROPIC_API_KEY` in Streamlit secrets.\n"
+                "- **Google Gemini** (free tier, 1500 req/day): set "
+                "`GOOGLE_API_KEY` in Streamlit secrets.\n\n"
+                "When BOTH keys are set, the tool runs both AIs and shows "
+                "their analyses side-by-side so you can compare."
             )
-        if a:
-            st.subheader("Data quality audit")
-            st.markdown(a)
-        if i:
-            st.subheader("Strategic insights")
-            st.markdown(i)
+        else:
+            # Build a sub-tab per provider that produced output
+            provider_labels = {
+                "anthropic": "🤖 Claude (Anthropic)",
+                "gemini": "✨ Gemini (Google)",
+            }
+            sub_tabs = st.tabs([provider_labels.get(p, p) for p in providers_used])
+            for sub_tab, p in zip(sub_tabs, providers_used):
+                with sub_tab:
+                    if p == "anthropic":
+                        st.caption(
+                            "Claude Sonnet 4.6 · paid · most rigorous on "
+                            "structured-data audit and unit-error detection."
+                        )
+                    elif p == "gemini":
+                        st.caption(
+                            "Gemini 2.0 Flash · free tier · faster response, "
+                            "broadly capable. Use to cross-check Claude's "
+                            "audit when both keys are configured."
+                        )
+                    audit_for = audit_by_provider.get(p)
+                    insights_for = insights_by_provider.get(p)
+                    if audit_for:
+                        st.subheader("Data quality audit")
+                        st.markdown(audit_for)
+                    if insights_for:
+                        st.subheader("Strategic insights")
+                        st.markdown(insights_for)
+                    if not (audit_for or insights_for):
+                        st.warning(
+                            f"{provider_labels.get(p, p)} returned no output. "
+                            "Check API key validity and rate limits."
+                        )
+
+            # When both ran, offer a side-by-side comparison view
+            if len(providers_used) > 1:
+                st.divider()
+                st.subheader("Cross-AI comparison")
+                st.caption(
+                    "If the two AIs disagree on flagging or insight emphasis, "
+                    "that disagreement is itself signal — investigate the "
+                    "underlying value."
+                )
 
     # ── Copilot / Claude analysis prompt ────────────────────────────────────
     with tab_copilot_prompt:
