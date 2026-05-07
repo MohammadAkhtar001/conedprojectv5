@@ -44,7 +44,7 @@ from .company_registry import Company
 log = logging.getLogger("ai_fallback")
 
 
-def _client():
+def _anthropic_client():
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key or key.startswith("sk-ant-...") or len(key) < 20:
         return None
@@ -53,6 +53,22 @@ def _client():
         return Anthropic(api_key=key)
     except ImportError:
         return None
+
+
+def _gemini_client():
+    key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not key or len(key) < 20:
+        return None
+    try:
+        from google import genai
+        return genai.Client(api_key=key)
+    except ImportError:
+        return None
+
+
+# Backwards-compat shim
+def _client():
+    return _anthropic_client()
 
 
 class AiFallbackExtractor(Extractor):
@@ -69,20 +85,47 @@ class AiFallbackExtractor(Extractor):
     base_confidence = 0.50
 
     def extract(self, company: Company, metrics: Iterable[str]) -> list[DataPoint]:
-        client = _client()
-        if not client:
+        anthropic_client = _anthropic_client()
+        gemini_client = _gemini_client()
+
+        if not anthropic_client and not gemini_client:
             return [make_failure(
                 company=company.name, metric=m,
-                reason="AI fallback unavailable (ANTHROPIC_API_KEY not set)",
+                reason=("AI fallback unavailable — neither ANTHROPIC_API_KEY "
+                        "nor GOOGLE_API_KEY is set in Streamlit secrets."),
                 attempts=[],
             ) for m in metrics]
 
         results = []
         for metric in metrics:
-            results.append(self._extract_one(client, company, metric))
-        return results
+            # Try Anthropic first (it has web_search), fall back to Gemini
+            dp = None
+            if anthropic_client:
+                dp = self._extract_one_anthropic(anthropic_client, company, metric)
+                if dp.ok:
+                    results.append(dp)
+                    continue
+            if gemini_client:
+                dp_g = self._extract_one_gemini(gemini_client, company, metric)
+                if dp_g.ok:
+                    results.append(dp_g)
+                    continue
+                # If we have an earlier Anthropic failure, attach Gemini's
+                # attempts to it for the audit trail
+                if dp is not None:
+                    dp.attempts = dp.attempts + dp_g.attempts
+            results.append(dp if dp is not None else (dp_g if gemini_client else None))
+        # Defensive: filter Nones (shouldn't happen but be safe)
+        return [r for r in results if r is not None]
 
-    def _extract_one(self, client, company: Company, metric: str) -> DataPoint:
+    def _extract_one_anthropic(self, client, company: Company, metric: str) -> DataPoint:
+        return self._extract_one(client, company, metric, provider="anthropic")
+
+    def _extract_one_gemini(self, client, company: Company, metric: str) -> DataPoint:
+        return self._extract_one(client, company, metric, provider="gemini")
+
+    def _extract_one(self, client, company: Company, metric: str,
+                     *, provider: str = "anthropic") -> DataPoint:
         meta = METRICS.get(metric)
         if not meta:
             # Custom metric — no validation rules, just ask for the value
@@ -128,38 +171,51 @@ Output schema:
         attempts: list[ExtractionAttempt] = []
         text = ""
         used_search = False
+        provider_label = "Claude" if provider == "anthropic" else "Gemini"
+        endpoint_url = (f"anthropic://messages" if provider == "anthropic"
+                        else "gemini://generate_content")
         try:
-            # Try with web_search first; some models (Haiku family) don't
-            # support tools and will 400.  Fall back to no-tools mode in
-            # that case — Claude can still attempt the answer from training
-            # data, and we lower the confidence accordingly.
-            try:
-                msg = client.messages.create(
-                    model="claude-3-5-sonnet-latest",
-                    max_tokens=2000,
-                    messages=[{"role": "user", "content": prompt}],
-                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                )
-                used_search = True
-            except Exception as search_err:
-                err_str = str(search_err).lower()
-                if ("tool" in err_str or "web_search" in err_str
-                        or "not supported" in err_str or "400" in err_str):
-                    log.info("web_search not supported by model; retrying without tools")
+            if provider == "anthropic":
+                # Try with web_search first; fall back to no-tools mode if
+                # the model rejects it.
+                try:
                     msg = client.messages.create(
-                        model="claude-3-5-sonnet-latest",
+                        model="claude-sonnet-4-6",
                         max_tokens=2000,
                         messages=[{"role": "user", "content": prompt}],
+                        tools=[{"type": "web_search_20250305", "name": "web_search"}],
                     )
-                else:
-                    raise
-
-            text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+                    used_search = True
+                except Exception as search_err:
+                    err_str = str(search_err).lower()
+                    if ("tool" in err_str or "web_search" in err_str
+                            or "not supported" in err_str or "400" in err_str):
+                        log.info("web_search not supported; retrying without tools")
+                        msg = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=2000,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                    else:
+                        raise
+                text = "".join(
+                    b.text for b in msg.content if getattr(b, "type", None) == "text"
+                )
+            elif provider == "gemini":
+                # Gemini free tier has no web_search; values come from
+                # training data only.  Cap confidence accordingly later.
+                resp = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                )
+                text = (resp.text or "")
+                used_search = False
 
             # Log a synthetic attempt so the audit trail shows the AI was tried.
+            search_suffix = " (with web_search)" if used_search else " (no search)"
             attempts.append(ExtractionAttempt(
-                source=self.source_name + (" (with web_search)" if used_search else " (no search)"),
-                url="anthropic://messages",
+                source=f"{self.source_name} [{provider_label}]" + search_suffix,
+                url=endpoint_url,
                 method="POST", status_code=200,
                 content_type="application/json",
                 response_bytes=len(text or ""),
@@ -168,7 +224,8 @@ Output schema:
             ))
         except Exception as e:
             attempts.append(ExtractionAttempt(
-                source=self.source_name, url="anthropic://messages",
+                source=f"{self.source_name} [{provider_label}]",
+                url=endpoint_url,
                 method="POST", status_code=None,
                 content_type=None, response_bytes=None,
                 response_preview="", selectors_matched=None,
@@ -231,7 +288,7 @@ Output schema:
             unit=parsed.get("unit") or unit,
             year=parsed.get("year"),
             source_url=parsed.get("source_url"),
-            source_name=f"{self.source_name} → {parsed.get('source_name', 'unknown')}",
+            source_name=f"{self.source_name} [{provider_label}] → {parsed.get('source_name', 'unknown')}",
             confidence_score=confidence,
             attempts=attempts,
             notes=notes_text,
