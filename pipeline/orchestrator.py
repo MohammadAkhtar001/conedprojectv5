@@ -109,6 +109,76 @@ def _fuzzy_match_metric(user_metric: str) -> Optional[str]:
     return None
 
 
+def infer_metric_unit(user_metric: str) -> tuple[str, str]:
+    """Best-effort guess at unit + description for an unknown metric name.
+    Returns (unit, short_description).
+
+    Strategy:
+      1. If the metric fuzzy-matches a standard METRICS entry, use that
+         entry's unit and description.
+      2. Otherwise, look for unit-suggesting keywords in the metric name:
+         dollar-style ($M / $B) for "giving"/"investment"/"funding",
+         percent for "%/pct/percentage/share/rate",
+         hours for "hours"/"hrs",
+         counts for "number of"/"count of",
+         CO2 for "emissions"/"carbon",
+         etc.
+      3. Fallback: empty unit + "(custom metric)".
+    """
+    matched = _fuzzy_match_metric(user_metric)
+    if matched:
+        meta = METRICS[matched]
+        return meta["unit"], (
+            f"Routed to standard metric '{meta['label']}' — "
+            f"{meta['description']}"
+        )
+
+    n = re.sub(r"[_\-/.,]", " ", user_metric.lower())
+    n = re.sub(r"\s+", " ", n).strip()
+
+    # Money-like terms
+    if any(kw in n for kw in ("revenue", "sales", "income", "profit",
+                              "earnings", "ebitda")):
+        return "$B", "Inferred unit — financial figure, likely billions of dollars"
+    if any(kw in n for kw in ("giving", "donat", "grant", "funding",
+                              "investment", "philanthrop", "match",
+                              "assistance", "scholarship", "spending",
+                              "expenditure")):
+        return "$M", "Inferred unit — philanthropic / spending figure, likely millions of dollars"
+
+    # Percentages
+    if any(kw in n for kw in ("%", " pct", "percent", "percentage", "share",
+                              "ratio", " rate", "proportion")):
+        return "%", "Inferred unit — percentage"
+
+    # Time / hours
+    if "hours" in n or "hrs" in n:
+        return "hrs/yr", "Inferred unit — hours per year"
+    if any(kw in n for kw in ("minutes", "saidi", "caidi", "outage")):
+        return "min/yr", "Inferred unit — minutes per year (reliability metric)"
+
+    # Counts
+    if any(kw in n for kw in ("number of", "num of", "count of", "count",
+                              "total grants", "grants paid")):
+        return "count", "Inferred unit — count of items"
+
+    # Emissions
+    if any(kw in n for kw in ("emission", "co2", "carbon", "ghg",
+                              "greenhouse", "scope 1", "scope 2", "scope 3")):
+        return "M MT CO2", "Inferred unit — million metric tons CO2 equivalent"
+
+    # Energy
+    if any(kw in n for kw in ("mwh", "megawatt", "kwh", "kilowatt", "gwh",
+                              "gigawatt")):
+        return "MWh", "Inferred unit — megawatt-hours"
+
+    # Score / index
+    if any(kw in n for kw in ("score", "index", "rating")):
+        return "/100", "Inferred unit — score (out of 100)"
+
+    return "", "Custom metric — unit could not be inferred from the name"
+
+
 def run_pipeline(
     company_names: Iterable[str],
     metrics: Iterable[str],
