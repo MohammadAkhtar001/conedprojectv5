@@ -42,6 +42,7 @@ class Company:
     eia_op_ids: tuple[int, ...] = ()    # may be multiple operating subs
     egrid_operator_names: tuple[str, ...] = ()
     state_puc_codes: tuple[str, ...] = ()  # informational
+    ferc_respondent_ids: tuple[int, ...] = ()  # FERC Form 1 filer IDs
     notes: str = ""
 
 
@@ -57,6 +58,7 @@ REGISTRY: dict[str, Company] = {
         eia_op_ids=(13511, 49328),              # CECONY + O&R
         egrid_operator_names=(),                # no owned generation
         state_puc_codes=("NY-PSC",),
+        ferc_respondent_ids=(133, 311),          # Con Edison Co of NY + O&R
         notes="Pure T&D distributor (NY); divested all generation by 2008.",
     ),
     "duke_energy": Company(
@@ -76,6 +78,7 @@ REGISTRY: dict[str, Company] = {
             "Duke Energy Ohio, Inc",
         ),
         state_puc_codes=("NC-NCUC", "SC-PSC", "FL-PSC", "IN-IURC", "OH-PUCO", "KY-PSC"),
+        ferc_respondent_ids=(149, 156, 165, 159, 163, 161),
         notes="Integrated generator across 6 states.",
     ),
     "national_grid": Company(
@@ -100,6 +103,7 @@ REGISTRY: dict[str, Company] = {
         eia_op_ids=(13501, 40209),              # Niagara Mohawk + Mass Electric
         egrid_operator_names=(),
         state_puc_codes=("NY-PSC", "MA-DPU", "RI-PUC"),
+        ferc_respondent_ids=(296,),  # Niagara Mohawk Power Corporation
         notes=("US subsidiary of UK-listed parent.  Revenue from Niagara Mohawk "
                "10-K (NY op sub) — partial coverage; full US revenue requires "
                "summing all US subs.  Foundation name varies — also try "
@@ -115,6 +119,7 @@ REGISTRY: dict[str, Company] = {
         eia_op_ids=(14328,),
         egrid_operator_names=("Pacific Gas and Electric Company",),
         state_puc_codes=("CA-CPUC",),
+        ferc_respondent_ids=(386,),
         notes="Owns Diablo Canyon nuclear + hydro fleet (renewable-heavy generation).",
     ),
     "eversource": Company(
@@ -127,6 +132,7 @@ REGISTRY: dict[str, Company] = {
         eia_op_ids=(13998, 13771),              # Connecticut Light & Power + NSTAR
         egrid_operator_names=(),
         state_puc_codes=("CT-PURA", "MA-DPU", "NH-PUC"),
+        ferc_respondent_ids=(108, 268, 333),  # CL&P + NSTAR (now Eversource Mass) + PSNH
         notes="Pure T&D in New England.",
     ),
     "southern": Company(
@@ -184,6 +190,7 @@ REGISTRY: dict[str, Company] = {
             "Public Service Electric & Gas Co",
         ),
         state_puc_codes=("NJ-BPU",),
+        ferc_respondent_ids=(391,),  # Public Service Electric and Gas Co
         notes=("NJ-based holding company.  Includes PSE&G (regulated NJ "
                "T&D), PSEG Power (merchant generation), and PSEG LI (LIPA "
                "operator).  Revenue figure is consolidated."),
@@ -202,6 +209,7 @@ REGISTRY: dict[str, Company] = {
         eia_op_ids=(4110, 14940, 1311, 14127, 13407, 4922),
         egrid_operator_names=(),
         state_puc_codes=("IL-ICC", "PA-PUC", "MD-PSC", "DC-PSC", "NJ-BPU", "DE-PSC"),
+        ferc_respondent_ids=(115, 357, 88, 386, 18, 145),
         notes=("Largest US T&D-only holding co after 2022 Constellation "
                "spinoff.  Owns ComEd (IL), PECO (PA), BGE (MD), Pepco/ACE/"
                "Delmarva (DC/NJ/DE/MD).  No owned generation."),
