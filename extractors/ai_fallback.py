@@ -72,6 +72,64 @@ def _client():
     return _anthropic_client()
 
 
+# ── Module-level rate-limit tracking ───────────────────────────────────────
+# These persist across all calls to extract() within a single Python
+# process, so that as the orchestrator iterates over (company × metric)
+# pairs the pacing knowledge carries forward.
+#
+# Anthropic Sonnet/Haiku free + low tiers cap at ~30K input tokens/minute.
+# Each AI fallback call is ~600-1500 input tokens (with web_search system
+# prompt and tools), and at most 5-15 calls per benchmark run.  Pacing
+# every 4-5 seconds keeps us safely under cap.
+#
+# Gemini 2.0 Flash free tier is 15 RPM (4 seconds between calls minimum).
+
+_LAST_ANTHROPIC_CALL_AT: float = 0.0
+_LAST_GEMINI_CALL_AT: float = 0.0
+_ANTHROPIC_MIN_INTERVAL_S: float = 5.0
+_GEMINI_MIN_INTERVAL_S: float = 5.0
+
+# When a provider just 429'd, cool off longer before hitting it again.
+_ANTHROPIC_COOLDOWN_UNTIL: float = 0.0
+_GEMINI_COOLDOWN_UNTIL: float = 0.0
+
+
+def _wait_for_rate_window(provider: str) -> None:
+    """Sleep until enough time has passed since the last call to provider,
+    AND until any active cooldown has expired."""
+    global _LAST_ANTHROPIC_CALL_AT, _LAST_GEMINI_CALL_AT
+    import time as _t
+    now = _t.time()
+    if provider == "anthropic":
+        target = max(
+            _LAST_ANTHROPIC_CALL_AT + _ANTHROPIC_MIN_INTERVAL_S,
+            _ANTHROPIC_COOLDOWN_UNTIL,
+        )
+        wait = max(0.0, target - now)
+        if wait > 0:
+            _t.sleep(wait)
+        _LAST_ANTHROPIC_CALL_AT = _t.time()
+    elif provider == "gemini":
+        target = max(
+            _LAST_GEMINI_CALL_AT + _GEMINI_MIN_INTERVAL_S,
+            _GEMINI_COOLDOWN_UNTIL,
+        )
+        wait = max(0.0, target - now)
+        if wait > 0:
+            _t.sleep(wait)
+        _LAST_GEMINI_CALL_AT = _t.time()
+
+
+def _mark_rate_limited(provider: str) -> None:
+    """Set a long cooldown for a provider that just 429'd."""
+    global _ANTHROPIC_COOLDOWN_UNTIL, _GEMINI_COOLDOWN_UNTIL
+    import time as _t
+    if provider == "anthropic":
+        _ANTHROPIC_COOLDOWN_UNTIL = _t.time() + 30.0  # wait 30s before next
+    elif provider == "gemini":
+        _GEMINI_COOLDOWN_UNTIL = _t.time() + 30.0
+
+
 class AiFallbackExtractor(Extractor):
     """Last-resort extractor that uses Claude + web_search.
 
@@ -106,20 +164,9 @@ class AiFallbackExtractor(Extractor):
                 dp_anthropic = self._extract_one_anthropic(anthropic_client, company, metric)
                 if dp_anthropic.ok:
                     results.append(dp_anthropic)
-                    # Pace successful Anthropic calls — keeps us under the
-                    # token-rate limit when there are many fallbacks.
-                    time.sleep(2.0)
                     continue
-
-                # Anthropic failed.  If it was a rate limit, the retry
-                # logic already backed off; skip the additional pace delay
-                # and jump to Gemini immediately.
-                anthropic_reason = (dp_anthropic.error or {}).get("reason", "").lower()
-                anthropic_was_rate_limited = (
-                    "429" in anthropic_reason or "rate" in anthropic_reason
-                    or "exceed" in anthropic_reason)
-                if not anthropic_was_rate_limited:
-                    time.sleep(0.5)
+                # Anthropic failed — _wait_for_rate_window handles cooldown
+                # automatically when next call happens, so no sleep here.
 
             if gemini_client:
                 dp_gemini = self._extract_one_gemini(gemini_client, company, metric)
@@ -133,12 +180,7 @@ class AiFallbackExtractor(Extractor):
                                   f"{(dp_anthropic.error or {}).get('reason', '')[:100]}. ")
                         dp_gemini.notes = (prefix + (dp_gemini.notes or "")).strip()
                     results.append(dp_gemini)
-                    # Gemini free tier is ~15 req/min — pace at 4s to stay safe
-                    time.sleep(4.0)
                     continue
-                # Gemini also failed; pace before next loop iteration to
-                # avoid hammering both providers
-                time.sleep(2.0)
 
             # Neither provider produced a valid value.  Build a combined
             # failure DataPoint that surfaces BOTH provider errors so the
@@ -222,6 +264,7 @@ Confidence: 0.85=regulator, 0.60=CSR, 0.50=survey, 0.30=news."""
 
         try:
             if provider == "anthropic":
+                _wait_for_rate_window("anthropic")
                 # Try with web_search first; fall back to no-tools mode if
                 # the model rejects it.
                 try:
@@ -238,6 +281,7 @@ Confidence: 0.85=regulator, 0.60=CSR, 0.50=survey, 0.30=news."""
                             or "not supported" in err_str
                             or ("400" in err_str and "429" not in err_str)):
                         log.info("web_search not supported; retrying without tools")
+                        _wait_for_rate_window("anthropic")
                         msg = _call_with_retry(lambda: client.messages.create(
                             model="claude-haiku-4-5-20251001",
                             max_tokens=1500,
@@ -249,6 +293,7 @@ Confidence: 0.85=regulator, 0.60=CSR, 0.50=survey, 0.30=news."""
                     b.text for b in msg.content if getattr(b, "type", None) == "text"
                 )
             elif provider == "gemini":
+                _wait_for_rate_window("gemini")
                 # Gemini free tier has no web_search; values come from
                 # training data only.  Cap confidence accordingly later.
                 resp = _call_with_retry(lambda: client.models.generate_content(
@@ -270,6 +315,10 @@ Confidence: 0.85=regulator, 0.60=CSR, 0.50=survey, 0.30=news."""
                 selectors_matched=None, duration_ms=0, success=True,
             ))
         except Exception as e:
+            # If this was a rate limit, mark the provider as cooled down so
+            # subsequent calls in this run wait longer before hitting again.
+            if _is_rate_limit_error(e):
+                _mark_rate_limited(provider)
             attempts.append(ExtractionAttempt(
                 source=f"{self.source_name} [{provider_label}]",
                 url=endpoint_url,
