@@ -146,6 +146,466 @@ REGISTRY: dict[str, Company] = {
         state_puc_codes=("GA-PSC", "AL-PSC", "MS-PSC"),
         notes="Integrated generator across the Southeast.",
     ),
+    "pseg_long_island": Company(
+        name="PSEG Long Island",
+        aliases=("PSEG LI", "PSEG-LI", "Long Island Power Authority operations"),
+        is_integrated_generator=False,
+        # PSEG LI is a wholly-owned subsidiary of Public Service Enterprise
+        # Group Inc (parent CIK 0000788784) operating LIPA's T&D system
+        # under contract.  PSEG LI itself doesn't file separate 10-Ks, so
+        # we route to the parent for revenue.  Note: parent revenue covers
+        # NJ utility + power gen + LI ops combined; LI-only revenue isn't
+        # broken out as a separate line.
+        cik="0000788784",                       # Public Service Enterprise Group Inc
+        foundation_ein=None,                    # resolved by name lookup at runtime
+        foundation_name="PSEG Foundation",
+        eia_op_ids=(),                          # LIPA is the registered utility, not PSEG LI
+        egrid_operator_names=(),                # no owned generation; LIPA contracts
+        state_puc_codes=("NY-DPS",),
+        notes=("Operates Long Island Power Authority (LIPA) T&D system under "
+               "contract.  Pure distributor with no owned generation.  "
+               "Revenue is from parent PSEG Inc consolidated 10-K — covers "
+               "NJ utility (PSE&G) + LI ops + other; LI segment not "
+               "separately reported.  Foundation is the parent-level "
+               "PSEG Foundation, not LI-specific."),
+    ),
+    "pseg": Company(
+        name="Public Service Enterprise Group",
+        aliases=("PSEG", "PSE&G", "Public Service Electric and Gas",
+                 "Public Service Enterprise Group Inc", "PEG"),
+        is_integrated_generator=True,
+        cik="0000788784",                       # Public Service Enterprise Group Inc
+        foundation_ein=None,
+        foundation_name="PSEG Foundation",
+        eia_op_ids=(15472,),                    # Public Service Elec & Gas Co
+        egrid_operator_names=(
+            "PSEG Fossil LLC",
+            "PSEG Nuclear LLC",
+            "Public Service Electric & Gas Co",
+        ),
+        state_puc_codes=("NJ-BPU",),
+        notes=("NJ-based holding company.  Includes PSE&G (regulated NJ "
+               "T&D), PSEG Power (merchant generation), and PSEG LI (LIPA "
+               "operator).  Revenue figure is consolidated."),
+    ),
+
+    # ── Northeast / Mid-Atlantic Tristate ─────────────────────────────────
+
+    "exelon": Company(
+        name="Exelon Corporation",
+        aliases=("Exelon", "EXC", "ComEd", "PECO", "BGE", "Pepco",
+                 "Atlantic City Electric", "Delmarva Power"),
+        is_integrated_generator=False,
+        cik="0001109357",
+        foundation_ein=None,
+        foundation_name="Exelon Foundation",
+        eia_op_ids=(4110, 14940, 1311, 14127, 13407, 4922),
+        egrid_operator_names=(),
+        state_puc_codes=("IL-ICC", "PA-PUC", "MD-PSC", "DC-PSC", "NJ-BPU", "DE-PSC"),
+        notes=("Largest US T&D-only holding co after 2022 Constellation "
+               "spinoff.  Owns ComEd (IL), PECO (PA), BGE (MD), Pepco/ACE/"
+               "Delmarva (DC/NJ/DE/MD).  No owned generation."),
+    ),
+
+    "fenoc": Company(
+        name="FirstEnergy",
+        aliases=("FirstEnergy Corp", "FE", "JCP&L", "Jersey Central Power & Light",
+                 "Met-Ed", "Penelec", "Penn Power", "West Penn Power",
+                 "Ohio Edison", "Toledo Edison", "Cleveland Electric",
+                 "Mon Power", "Potomac Edison"),
+        is_integrated_generator=False,
+        cik="0001031296",
+        foundation_ein=None,
+        foundation_name="FirstEnergy Foundation",
+        eia_op_ids=(13998, 18642, 14015, 14020),
+        egrid_operator_names=(),
+        state_puc_codes=("OH-PUCO", "PA-PUC", "NJ-BPU", "WV-PSC", "MD-PSC", "NY-PSC"),
+        notes=("OH-headquartered T&D holding co.  10 operating companies "
+               "across OH, PA, NJ, WV, MD, NY (including JCP&L in NJ "
+               "tristate area).  Sold all merchant generation in 2020."),
+    ),
+
+    "central_hudson": Company(
+        name="Central Hudson Gas & Electric",
+        aliases=("Central Hudson", "CH Energy Group", "CenHud", "CHG&E"),
+        is_integrated_generator=False,
+        # Central Hudson's parent is Fortis Inc (Canadian). The US sub
+        # historically filed 10-Ks but stopped after Fortis acquisition in
+        # 2013.  AI fallback will hit Fortis annual report or NY DPS filings.
+        cik=None,
+        foundation_ein=None,
+        foundation_name="Central Hudson Gas & Electric Corporation Foundation",
+        eia_op_ids=(3266,),
+        egrid_operator_names=(),
+        state_puc_codes=("NY-PSC",),
+        notes=("Hudson Valley utility serving ~300K customers in 8 NY "
+               "counties.  Subsidiary of Fortis Inc (Canada)."),
+    ),
+
+    "nysed": Company(
+        name="New York State Electric & Gas",
+        aliases=("NYSEG", "NY State Electric and Gas", "Avangrid Networks NY"),
+        is_integrated_generator=False,
+        # NYSEG parent is Avangrid (subsidiary of Iberdrola).
+        cik="0001601072",   # Avangrid Inc
+        foundation_ein=None,
+        foundation_name="Avangrid Foundation",
+        eia_op_ids=(13573,),
+        egrid_operator_names=(),
+        state_puc_codes=("NY-PSC",),
+        notes=("Upstate NY utility.  Subsidiary of Avangrid Inc, which is "
+               "majority-owned by Spain's Iberdrola.  Revenue routed via "
+               "Avangrid 10-K (consolidated NY + ME + CT)."),
+    ),
+
+    "rochester_gas_electric": Company(
+        name="Rochester Gas and Electric",
+        aliases=("RG&E", "Rochester Gas & Electric", "Avangrid RG&E"),
+        is_integrated_generator=False,
+        cik="0001601072",   # Avangrid Inc parent
+        foundation_ein=None,
+        foundation_name="Avangrid Foundation",
+        eia_op_ids=(16387,),
+        egrid_operator_names=(),
+        state_puc_codes=("NY-PSC",),
+        notes=("Western NY utility serving Rochester area.  Subsidiary "
+               "of Avangrid Inc (Iberdrola).  Revenue from Avangrid "
+               "consolidated 10-K."),
+    ),
+
+    "orange_rockland": Company(
+        name="Orange and Rockland Utilities",
+        aliases=("O&R", "Orange & Rockland", "ORU"),
+        is_integrated_generator=False,
+        # O&R is a subsidiary of Con Edison, Inc.  Files with SEC as part
+        # of the Con Edison consolidated 10-K.
+        cik="0001047862",   # Con Edison parent
+        foundation_ein=None,
+        foundation_name="Consolidated Edison Foundation",   # parent foundation
+        eia_op_ids=(49328,),
+        egrid_operator_names=(),
+        state_puc_codes=("NY-PSC", "NJ-BPU"),
+        notes=("Subsidiary of Con Edison serving NY counties of Orange/"
+               "Rockland and parts of NJ/PA.  Revenue is consolidated "
+               "into Con Edison 10-K, not separately reported."),
+    ),
+
+    # New England
+
+    "national_grid_ne": Company(
+        name="National Grid New England",
+        aliases=("National Grid Massachusetts", "Mass Electric",
+                 "Narragansett Electric", "National Grid RI"),
+        is_integrated_generator=False,
+        cik=None,   # subsidiaries don't file current XBRL
+        foundation_ein=None,
+        foundation_name="National Grid Foundation",
+        eia_op_ids=(13501, 40209, 13260),
+        egrid_operator_names=(),
+        state_puc_codes=("MA-DPU", "RI-PUC"),
+        notes=("New England operations of National Grid USA: Mass "
+               "Electric (MA) + Narragansett Electric (RI). Subsidiary of "
+               "UK-listed National Grid plc."),
+    ),
+
+    "united_illuminating": Company(
+        name="United Illuminating",
+        aliases=("UI", "United Illuminating Company", "Avangrid UI"),
+        is_integrated_generator=False,
+        cik="0001601072",   # Avangrid Inc parent
+        foundation_ein=None,
+        foundation_name="Avangrid Foundation",
+        eia_op_ids=(19436,),
+        egrid_operator_names=(),
+        state_puc_codes=("CT-PURA",),
+        notes=("Connecticut utility serving New Haven area, ~340K "
+               "customers.  Subsidiary of Avangrid Inc."),
+    ),
+
+    "central_maine_power": Company(
+        name="Central Maine Power",
+        aliases=("CMP", "Avangrid CMP"),
+        is_integrated_generator=False,
+        cik="0001601072",   # Avangrid Inc parent
+        foundation_ein=None,
+        foundation_name="Avangrid Foundation",
+        eia_op_ids=(3266,),
+        egrid_operator_names=(),
+        state_puc_codes=("ME-PUC",),
+        notes=("Largest electric utility in Maine, ~640K customers. "
+               "Subsidiary of Avangrid Inc (Iberdrola)."),
+    ),
+
+    "unitil": Company(
+        name="Unitil Corporation",
+        aliases=("Unitil", "UTL", "Fitchburg Gas and Electric"),
+        is_integrated_generator=False,
+        cik="0000755001",
+        foundation_ein=None,
+        foundation_name="Unitil Charitable Foundation",
+        eia_op_ids=(7251, 13573),
+        egrid_operator_names=(),
+        state_puc_codes=("NH-PUC", "MA-DPU", "ME-PUC"),
+        notes=("Small T&D utility serving NH, MA, and ME (~108K "
+               "customers).  Foundation is small; CSR data limited."),
+    ),
+
+    "versant": Company(
+        name="Versant Power",
+        aliases=("Versant", "Bangor Hydro", "Maine Public Service"),
+        is_integrated_generator=False,
+        # Versant's parent is ENMAX (Calgary, Canada). No US 10-K.
+        cik=None,
+        foundation_ein=None,
+        foundation_name=None,
+        eia_op_ids=(1167, 11522),
+        egrid_operator_names=(),
+        state_puc_codes=("ME-PUC",),
+        notes=("Northern Maine utility (Bangor Hydro + Maine Public "
+               "Service consolidated 2020). Owned by Calgary's ENMAX. "
+               "Limited US disclosure."),
+    ),
+
+    # NY public power / authorities
+
+    "lipa": Company(
+        name="Long Island Power Authority",
+        aliases=("LIPA", "Long Island Power"),
+        is_integrated_generator=False,
+        # LIPA is a NY State public-benefit corporation; files with NY
+        # Comptroller, not SEC. No 10-K available.
+        cik=None,
+        foundation_ein=None,
+        foundation_name=None,   # public authority, no foundation
+        eia_op_ids=(11243,),
+        egrid_operator_names=(),
+        state_puc_codes=("NY-PSC",),
+        notes=("NY State public-benefit corporation that owns Long "
+               "Island's electric T&D system.  Operates via PSEG LI "
+               "service contract.  No 10-K filings.  Annual report "
+               "available from LIPA website only."),
+    ),
+
+    "nypa": Company(
+        name="New York Power Authority",
+        aliases=("NYPA", "Power Authority of the State of New York", "PASNY"),
+        is_integrated_generator=True,
+        # NYPA is a NY State public-benefit corporation; no SEC filings.
+        cik=None,
+        foundation_ein=None,
+        foundation_name=None,
+        eia_op_ids=(13407,),
+        egrid_operator_names=("Power Authority of the State of New York",
+                              "New York Power Authority"),
+        state_puc_codes=("NY-PSC",),
+        notes=("Largest US state-owned electric utility.  Operates "
+               "Niagara, St. Lawrence, and other hydro generation, plus "
+               "transmission.  Public-benefit corp — no SEC filings.  "
+               "Revenue from NY State Comptroller filings."),
+    ),
+
+    # PJM-region (PA / NJ adjacent)
+
+    "ppl": Company(
+        name="PPL Corporation",
+        aliases=("PPL", "PPL Electric Utilities", "Talen Energy",
+                 "Louisville Gas & Electric", "Kentucky Utilities"),
+        is_integrated_generator=False,
+        cik="0000922224",
+        foundation_ein=None,
+        foundation_name="PPL Foundation",
+        eia_op_ids=(15296, 11249, 11241),
+        egrid_operator_names=(),
+        state_puc_codes=("PA-PUC", "KY-PSC", "RI-PUC"),
+        notes=("Allentown PA-based holding co.  Owns PPL Electric (PA), "
+               "Rhode Island Energy (acquired 2022), LG&E and KU (KY).  "
+               "Sold UK Western Power Distribution in 2021."),
+    ),
+
+    "rhode_island_energy": Company(
+        name="Rhode Island Energy",
+        aliases=("RI Energy", "Narragansett Electric (post-2022)"),
+        is_integrated_generator=False,
+        cik="0000922224",   # PPL Corp parent
+        foundation_ein=None,
+        foundation_name="PPL Foundation",
+        eia_op_ids=(13260,),
+        egrid_operator_names=(),
+        state_puc_codes=("RI-PUC",),
+        notes=("Acquired by PPL from National Grid in May 2022. Serves "
+               "~770K electric and ~280K gas customers in RI.  Revenue "
+               "consolidated into PPL 10-K."),
+    ),
+
+    # Mid-Atlantic
+
+    "dominion": Company(
+        name="Dominion Energy",
+        aliases=("Dominion", "D", "Dominion Resources",
+                 "Virginia Electric and Power"),
+        is_integrated_generator=True,
+        cik="0000715957",
+        foundation_ein=None,
+        foundation_name="Dominion Energy Charitable Foundation",
+        eia_op_ids=(19876, 14328),
+        egrid_operator_names=(
+            "Virginia Electric & Power Company",
+            "Dominion Energy South Carolina, Inc.",
+        ),
+        state_puc_codes=("VA-SCC", "NC-NCUC", "SC-PSC"),
+        notes=("VA-based integrated utility.  Owns Virginia Electric "
+               "(VA + NC) and Dominion Energy South Carolina."),
+    ),
+
+    "aep": Company(
+        name="American Electric Power",
+        aliases=("AEP", "American Electric Power Co", "AEP Ohio",
+                 "AEP Texas", "Appalachian Power", "Indiana Michigan Power",
+                 "Kentucky Power", "Public Service Co of Oklahoma"),
+        is_integrated_generator=True,
+        cik="0000004904",
+        foundation_ein=None,
+        foundation_name="American Electric Power Foundation",
+        eia_op_ids=(715, 16572, 814, 9267, 11241, 15470),
+        egrid_operator_names=(
+            "Appalachian Power Co",
+            "Indiana Michigan Power Co",
+            "Kentucky Power Co",
+            "Public Service Co of Oklahoma",
+            "Southwestern Electric Power Co",
+        ),
+        state_puc_codes=("OH-PUCO", "TX-PUC", "VA-SCC", "WV-PSC", "IN-IURC",
+                         "MI-PSC", "KY-PSC", "OK-OCC", "AR-PSC", "LA-PSC", "TN-TRA"),
+        notes=("OH-based integrated generator across 11 states. One of "
+               "the largest US power generators by capacity."),
+    ),
+
+    "edison_intl": Company(
+        name="Edison International",
+        aliases=("Edison Intl", "EIX", "Southern California Edison", "SCE"),
+        is_integrated_generator=False,
+        cik="0000827052",
+        foundation_ein=None,
+        foundation_name="Edison International Foundation",
+        eia_op_ids=(17609,),
+        egrid_operator_names=(),
+        state_puc_codes=("CA-CPUC",),
+        notes=("CA-based.  Owns Southern California Edison (largest CA "
+               "utility by customers).  Largely T&D after divestiture."),
+    ),
+
+    "sempra": Company(
+        name="Sempra Energy",
+        aliases=("Sempra", "SRE", "San Diego Gas & Electric", "SDG&E",
+                 "Southern California Gas", "SoCalGas"),
+        is_integrated_generator=True,
+        cik="0001032208",
+        foundation_ein=None,
+        foundation_name="Sempra Energy Foundation",
+        eia_op_ids=(16451, 17609),
+        egrid_operator_names=("San Diego Gas & Electric Co",),
+        state_puc_codes=("CA-CPUC",),
+        notes=("San Diego-based.  Owns SDG&E and SoCalGas (largest US "
+               "gas utility by customers)."),
+    ),
+
+    "xcel": Company(
+        name="Xcel Energy",
+        aliases=("Xcel", "XEL", "Northern States Power", "Public Service Co of Colorado",
+                 "Southwestern Public Service"),
+        is_integrated_generator=True,
+        cik="0000072903",
+        foundation_ein=None,
+        foundation_name="Xcel Energy Foundation",
+        eia_op_ids=(13781, 15466, 17716),
+        egrid_operator_names=(
+            "Northern States Power Co - Minnesota",
+            "Public Service Co of Colorado",
+            "Southwestern Public Service Co",
+        ),
+        state_puc_codes=("MN-PUC", "CO-PUC", "TX-PUC", "WI-PSC", "ND-PSC",
+                         "SD-PUC", "NM-PRC", "MI-PSC"),
+        notes=("Minneapolis-based integrated utility across 8 states."),
+    ),
+
+    "nextera": Company(
+        name="NextEra Energy",
+        aliases=("NextEra", "NEE", "Florida Power & Light", "FPL", "Gulf Power"),
+        is_integrated_generator=True,
+        cik="0000753308",
+        foundation_ein=None,
+        foundation_name="NextEra Energy Foundation",
+        eia_op_ids=(6452, 5416),
+        egrid_operator_names=(
+            "Florida Power & Light Co",
+            "Gulf Power Co",
+        ),
+        state_puc_codes=("FL-PSC",),
+        notes=("FL-based, owns FPL (largest US utility by customers and "
+               "renewable capacity).  Massive renewable generation fleet "
+               "via NextEra Energy Resources."),
+    ),
+
+    "ameren": Company(
+        name="Ameren Corporation",
+        aliases=("Ameren", "AEE", "Union Electric", "Ameren Missouri", "Ameren Illinois"),
+        is_integrated_generator=True,
+        cik="0001002910",
+        foundation_ein=None,
+        foundation_name="Ameren Corporation Charitable Trust",
+        eia_op_ids=(19436, 813),
+        egrid_operator_names=(
+            "Union Electric Co",
+            "Ameren Illinois Co",
+        ),
+        state_puc_codes=("MO-PSC", "IL-ICC"),
+        notes=("St. Louis-based.  Owns Ameren Missouri (integrated) and "
+               "Ameren Illinois (T&D-only post-2022)."),
+    ),
+
+    "wec": Company(
+        name="WEC Energy Group",
+        aliases=("WEC", "Wisconsin Energy", "Wisconsin Electric", "We Energies",
+                 "Peoples Gas", "North Shore Gas", "Wisconsin Public Service"),
+        is_integrated_generator=True,
+        cik="0000783325",
+        foundation_ein=None,
+        foundation_name="WEC Energy Group Foundation",
+        eia_op_ids=(20860, 4254, 4271),
+        egrid_operator_names=(
+            "Wisconsin Electric Power Co",
+            "Wisconsin Public Service Corp",
+        ),
+        state_puc_codes=("WI-PSC", "IL-ICC", "MI-PSC", "MN-PUC"),
+        notes=("WI-based.  Owns We Energies (WI) and Peoples Gas (Chicago)."),
+    ),
+
+    "dte": Company(
+        name="DTE Energy",
+        aliases=("DTE", "DTE Energy Co", "Detroit Edison"),
+        is_integrated_generator=True,
+        cik="0000936340",
+        foundation_ein=None,
+        foundation_name="DTE Energy Foundation",
+        eia_op_ids=(5109,),
+        egrid_operator_names=("DTE Electric Company",),
+        state_puc_codes=("MI-PSC",),
+        notes=("MI-based integrated utility (DTE Electric + DTE Gas). "
+               "Detroit-area service territory."),
+    ),
+
+    "cms": Company(
+        name="CMS Energy",
+        aliases=("CMS", "Consumers Energy"),
+        is_integrated_generator=True,
+        cik="0000811156",
+        foundation_ein=None,
+        foundation_name="Consumers Energy Foundation",
+        eia_op_ids=(4254,),
+        egrid_operator_names=("Consumers Energy Co",),
+        state_puc_codes=("MI-PSC",),
+        notes=("MI-based.  Owns Consumers Energy (Lower Michigan)."),
+    ),
 }
 
 
