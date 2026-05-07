@@ -477,6 +477,155 @@ def _methodology_note_for_metric(metric_key: str) -> str:
                                  "closest standard metric, or AI web search.")
 
 
+def _build_standalone_copilot_prompt() -> str:
+    """A self-contained prompt for Microsoft Copilot (or any AI with web
+    search) that lets a Con Edison analyst run a benchmark without needing
+    access to this Streamlit app.  Mirrors the tool's logic but no data
+    is pre-embedded — the analyst types in their companies and metrics."""
+
+    return """# Utility Benchmark — Standalone Copilot Mode
+
+You are an analyst's research assistant compiling a benchmark of US electric / gas utilities for the Con Edison Community Partnerships team. Behave like a hand-built data pipeline, not a generic LLM. Refuse to invent values. Cite every number.
+
+## How the analyst will use you
+
+1. They'll tell you a list of companies (e.g. "Con Edison, Duke Energy, PG&E, Eversource, National Grid USA").
+2. They'll tell you a list of metrics (e.g. "Revenue, Charitable Giving, Foundation Assets, Carbon Emissions Scope 1, Customer Satisfaction").
+3. You will compile a benchmark by walking the source priority list below for each (company × metric) pair.
+4. You will produce a per-metric breakdown, a peer-comparison standing for Con Edison, and 4-6 strategic insights.
+
+## Source priority order — walk this for EVERY (company, metric) pair
+
+For each pair, search ONLINE (use your web search tool) and stop at the FIRST source that returns a credible value.
+
+### Tier 1: Government / regulator-of-record (preferred — confidence 0.85–0.95)
+
+**Revenue → SEC EDGAR XBRL**
+- URL pattern: `https://data.sec.gov/api/xbrl/companyfacts/CIK{10digit}.json`
+- Pull most recent 10-K, fiscal-year value of `us-gaap:Revenues` (or close equivalent). Convert to $B.
+- If the company doesn't file 10-Ks (UK parents like National Grid plc, public-power utilities), say so explicitly and try the parent's annual report.
+
+**Foundation philanthropy → ProPublica Nonprofit Explorer (IRS Form 990-PF)**
+- Search by foundation name: `https://projects.propublica.org/nonprofits/`
+- Pull `cttgrntpd` / `grntspaid` (grants paid out) and `totassetsend` (foundation assets at year end).
+- ⚠️ This is the FOUNDATION-PAID slice only — note clearly that it does NOT include direct corporate contributions, energy assistance programs, or in-kind giving.
+
+**Carbon Emissions Scope 1 → EPA eGRID**
+- URL: `https://www.epa.gov/egrid` (latest annual release)
+- Sum plant-level CO₂ where the operator name matches the company. Convert short tons → million metric tons (× 0.907185 / 1e6).
+- ℹ️ Pure T&D distributors (Con Edison, Eversource, National Grid USA, PSEG Long Island) do NOT own generation tracked here — return null with "not applicable, pure distributor" rather than hunting.
+
+**Reliability (SAIDI), Renewable %, Generation Mix → EIA Form 861 / 923**
+- URL: `https://www.eia.gov/electricity/data/`
+- Filter by EIA Operator ID for the company.
+
+### Tier 2: Third-party surveys (confidence 0.50)
+
+**Customer Satisfaction → J.D. Power Residential Electric Study**
+- URL: `https://www.jdpower.com/business/press-releases/{year}-us-electric-utility-residential-customer-satisfaction-study`
+- Score is /1000 raw; normalize to /100.
+- ⚠️ Public press release names ONLY regional category WINNERS (~7-8 utilities). For everyone else, return null with reason — that is correct, not a failure.
+
+### Tier 3: Corporate disclosure (confidence 0.60)
+
+**CSR / Sustainability Report PDF → company website**
+- Search "{company name} sustainability report 2024 PDF" or "ESG report".
+- Find the most recent PDF on the company's own site.
+- Extract metrics for: Energy Assistance, Volunteer Hours, Employee Match, Number of Grants, Community Investment, STEM/Education Giving.
+- Anchor your extraction to a distinctive phrase ("$X million in energy assistance", "Y volunteer hours") and validate the captured number.
+
+### Tier 4: News / press release (confidence 0.30)
+
+Last resort. Cite source with URL. Mark as low-confidence.
+
+## Validation rules — REJECT values outside these ranges
+
+| Metric | Unit | Min | Max | Expected |
+|---|---|---|---|---|
+| Revenue | $B | 1 | 80 | $10–35B large IOU |
+| Foundation Grants Paid | $M | 0.01 | 200 | $0.5–20M |
+| Foundation Assets | $M | 0.5 | 500 | $5–100M |
+| Total Charitable Giving | $M | 0.01 | 500 | $5–100M |
+| Energy Assistance | $M | 0.1 | 100 | $1–30M |
+| Carbon Emissions Scope 1 | M MT CO2 | 0.5 | 200 | 2–10 distributor / 50–100 generator |
+| Customer Satisfaction | /100 | 30 | 80 | 45–55 |
+| Renewable % | % | 0 | 100 | 15–50% |
+| SAIDI | min/yr | 20 | 500 | 50–200 |
+| Volunteer Hours | hrs/yr | 100 | 500K | 5–100K |
+| Employee Match | $M | 0.05 | 50 | $0.5–10M |
+
+If a value is outside its plausible range, return null with reason. Do NOT pass it through.
+
+## Output structure
+
+For each metric you benchmark, produce a section in this format:
+
+---
+
+### {Metric Label} ({unit})
+**What it measures:** {description}
+**Expected range:** {expected_range}
+**Direction:** {higher/lower is better}
+
+**Values by company** (sorted best → worst):
+1. ✅ **{Company A}**: **{value} {unit}**  _({source}, {year}, {confidence}% confidence)_
+2. ✅ **{Company B}**: **{value} {unit}**  _({source}, {year}, {confidence}% confidence)_
+3. ⚠️ **{Company C}**: **{value} {unit}**  _({source}, {year}, {confidence}% confidence)_
+   - ⚠️ Caveat: foundation-only data; excludes direct corporate giving.
+
+**No value retrieved for:**
+- ℹ️ **{Company D}** — Not applicable: pure T&D distributor, no eGRID generation.
+- 🚩 **{Company E}** — Foundation not registered with IRS as 501(c)(3); company likely gives from operating budget.
+
+**Source URLs cited:**
+- {full URL 1}
+- {full URL 2}
+
+**Methodology:** {one-line explanation of where the data came from and any caveats}
+
+---
+
+## Flag system
+
+Every value gets a flag:
+- ✅ Verified, high confidence, no concerns
+- ⚠️ Caveat applies (partial coverage, foundation-only when total was implied, methodology mismatch)
+- 🚩 Data exists but couldn't be retrieved cleanly, OR very low confidence
+- ℹ️ Legitimately not applicable for this combination
+
+## After the per-metric breakdown, produce these closing sections
+
+### Where Con Edison stands (peer comparison)
+
+For every metric where Con Edison has a value, note: rank (#X of Y), distance from peer median (e.g. "20% below peer median"), and the leader/laggard. Be direct.
+
+### Strategic insights for the VP (4-6 bullets)
+
+Each insight starts with a **bolded headline** then 1-2 sentences. Focus on:
+- How Con Ed stacks up vs peers, normalized for company size
+- Specific competitive advantages or gaps
+- Anything that would change a board-level talking point
+
+### Recommended manual follow-ups (3 specific data pulls)
+
+For every 🚩 and missing value, name the specific source and section the analyst should check manually. Be precise enough that the lookup takes <15 minutes per pull.
+
+### Caveats the VP should know before quoting numbers
+
+Anything that, if mis-stated to the board, would damage credibility. Foundation-only philanthropy is the classic example.
+
+## Hard rules
+
+1. **Refuse to guess.** If you cannot find a credible source, return null with reason.
+2. **Cite every number with a URL.** Every single one. No exceptions.
+3. **Validate against the plausibility ranges above.** Reject and report null if outside.
+4. **Distinguish "not applicable" from "couldn't find it"** — use ℹ️ vs 🚩.
+5. **Foundation-only data must be flagged ⚠️.** Never present it as total philanthropy.
+
+When the analyst gives you a list of companies and metrics, confirm the inputs, then go.
+"""
+
+
 def _build_recreation_prompt() -> str:
     """A detailed meta-prompt that another AI can use to mimic this tool's
     behavior interactively, including all sources, methodology, and rules."""
@@ -594,6 +743,44 @@ Every value you output gets a flag based on these rules:
   - Any case where the data genuinely doesn't exist for this scope
 
 NEVER use 🚩 as a default for "no value". Pick the right flag based on the cause.
+
+---
+
+## PART 3.5 — Confidence scoring rules (explicit)
+
+Every value carries a confidence score 0.00–0.99. The rules:
+
+1. **Source-tier baseline:**
+   - SEC EDGAR XBRL exact: 0.95
+   - EPA eGRID, EIA datasets exact: 0.95
+   - IRS 990 / ProPublica exact: 0.85
+   - CSR PDF (anchored phrase + validated number): 0.60
+   - Third-party survey (J.D. Power, etc.): 0.50
+   - AI fallback with web_search: 0.65 default (up to 0.85 if from a regulator URL)
+   - AI fallback without web_search (training data only): cap 0.45
+   - Press release / news: 0.30
+   - **Missing data: 0.00** (explicit zero, not null — so it sorts correctly)
+
+2. **Cross-source agreement bonus:** When two independent sources return values within 10% of each other for the same (company, metric), raise both confidence scores by +0.05 (capped at 0.99). Note this in the value's notes field.
+
+3. **Validator failure:** If a candidate value falls outside the metric's plausibility range, REJECT it. Do NOT downgrade confidence and pass it through. Reject means null with reason.
+
+4. **Stale data penalty:** If the source year is more than 3 years old and a more recent year is available from the same source family but couldn't be retrieved, downgrade confidence by 0.10.
+
+---
+
+## PART 3.7 — Outlier and unit-error detection (mandatory pass)
+
+Before producing the final output, run an explicit AUDIT pass on every successful value. Specifically check for:
+
+1. **Order-of-magnitude errors:** Revenue $15,000B is wrong; should be $15B. Likely $ vs $B confusion.
+2. **Year bleeding into value field:** If revenue=2024 or charitable_giving=2023, that's almost certainly the year being misread as the value.
+3. **Unit confusion:** $M vs $B, hours vs days, % stored as 0.42 when the spreadsheet is showing 42.
+4. **Scale mismatch with company size:** Con Edison revenue = $0.05B is wrong; it's a $15B company. Check that the value is in the right ballpark for the company's revenue / customer count.
+5. **Suspicious uniformity:** A number that's exactly the same across multiple companies (suggests a copy-paste or unit-default error).
+6. **Peer outliers:** Value ≥5× peer median for metrics that normally cluster tightly (philanthropy, customer satisfaction).
+
+For each ✅ value, ask yourself: "Is this plausible for this company? Does the unit match the field? Is this the year column or the value column?" If anything is suspicious, downgrade to ⚠️ or 🚩 with explanation.
 
 ---
 
@@ -814,8 +1001,12 @@ if run_btn:
     progress = st.empty()
     progress.info(f"Running pipeline for {len(companies)} companies × {len(metrics)} metrics…")
 
+    from pipeline.ai_layer import apply_cross_source_bonus, compute_standing
+
     with st.spinner("Extracting…"):
         datapoints = run_pipeline(companies, metrics, use_ai_fallback=use_ai)
+    # Cross-source agreement boost (rewards values corroborated by 2+ sources)
+    apply_cross_source_bonus(datapoints)
     st.session_state["datapoints"] = datapoints
 
     audit_text = None
@@ -828,14 +1019,17 @@ if run_btn:
         with st.spinner("Generating insights…"):
             insights_text = generate_insights(datapoints, audit_text)
     else:
-        # Without AI we still apply the deterministic rule-based flags
-        # (low-confidence values and obvious peer-group outliers).
         from pipeline.ai_layer import rule_based_flags
         flags = rule_based_flags(datapoints)
+
+    # "Where does Con Edison stand" indicator — computed deterministically,
+    # always available regardless of AI status.
+    standings = compute_standing(datapoints, focus_company="Con Edison")
 
     st.session_state["audit"] = audit_text
     st.session_state["insights"] = insights_text
     st.session_state["flags"] = flags
+    st.session_state["standings"] = standings
 
     progress.success("Done.")
 
@@ -856,11 +1050,99 @@ if "datapoints" in st.session_state:
     c3.metric("Failed (null)", n_fail)
     c4.metric("Avg confidence", f"{avg_conf:.2f}" if avg_conf else "—")
 
-    (tab_table, tab_charts, tab_failures, tab_audit,
+    (tab_standing, tab_table, tab_charts, tab_failures, tab_audit,
      tab_copilot_prompt, tab_recreate_prompt, tab_export) = st.tabs([
-        "Benchmark", "Charts", "Failures", "AI Audit & Insights",
-        "📋 Copilot prompt", "🛠️ Recreation prompt", "Export",
+        "🎯 Where Con Ed Stands", "Benchmark", "Charts", "Failures",
+        "AI Audit & Insights", "📋 Copilot prompt",
+        "🛠️ Recreation prompt", "Export",
     ])
+
+    # ── Where Con Ed Stands tab ────────────────────────────────────────────
+    with tab_standing:
+        standings = st.session_state.get("standings") or {}
+        st.subheader("Con Edison's standing across each metric")
+        st.caption(
+            "For every metric in this run, this tab shows Con Edison's "
+            "ranking, distance from the peer median, and the leader / "
+            "laggard. Use this to brief executives without scanning the "
+            "full benchmark table."
+        )
+
+        if not standings:
+            st.info("Run a benchmark to populate this tab.")
+        else:
+            # Top-level summary metrics
+            top_n = sum(1 for s in standings.values() if s.get("verdict") == "Top performer")
+            above_n = sum(1 for s in standings.values()
+                          if s.get("verdict") in ("Top performer", "Above median"))
+            below_n = sum(1 for s in standings.values()
+                          if s.get("verdict") in ("Below median", "Lowest"))
+            no_data_n = sum(1 for s in standings.values()
+                            if s.get("verdict") in ("No data",))
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Top performer (#1)", f"{top_n} metrics")
+            c2.metric("Above median", f"{above_n} metrics")
+            c3.metric("Below median", f"{below_n} metrics")
+            c4.metric("No data", f"{no_data_n} metrics")
+            st.divider()
+
+            # Per-metric breakdown
+            for metric_key, info in standings.items():
+                meta = METRICS.get(metric_key, {})
+                label = meta.get("label", metric_key)
+                unit = meta.get("unit", "")
+                verdict = info.get("verdict", "—")
+
+                # Color-code the verdict
+                color_map = {
+                    "Top performer": "✅",
+                    "Above median": "🟢",
+                    "Median": "🟡",
+                    "Below median": "🟠",
+                    "Lowest": "🔴",
+                    "No data": "⚪",
+                    "Only data point": "ℹ️",
+                }
+                emoji = color_map.get(verdict, "•")
+
+                with st.container(border=True):
+                    head_col, badge_col = st.columns([3, 1])
+                    with head_col:
+                        st.markdown(f"### {label}")
+                        st.caption(unit if unit else "(custom unit)")
+                    with badge_col:
+                        st.markdown(
+                            f"<div style='text-align:right; font-size:1.6em;'>"
+                            f"{emoji} <b>{verdict}</b></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if info.get("focus_value") is None:
+                        st.warning(info.get("narrative", "No data."))
+                        continue
+
+                    cc1, cc2, cc3, cc4 = st.columns(4)
+                    cc1.metric("Con Edison", f"{info['focus_value']:g}")
+                    cc2.metric(
+                        "Rank",
+                        f"#{info['rank']} of {info['of_total']}" if info.get('rank') else "—",
+                    )
+                    if info.get("peer_median") is not None:
+                        cc3.metric("Peer median", f"{info['peer_median']:g}")
+                    if info.get("vs_median_pct") is not None:
+                        delta = info["vs_median_pct"]
+                        cc4.metric("vs Peer median",
+                                   f"{abs(delta):.0f}% {'above' if delta >= 0 else 'below'}")
+
+                    if info.get("best") and info.get("worst"):
+                        b_co, b_v = info["best"]
+                        w_co, w_v = info["worst"]
+                        st.caption(
+                            f"**Leader:** {b_co} at {b_v:g} {unit} · "
+                            f"**Laggard:** {w_co} at {w_v:g} {unit}"
+                        )
+                    st.markdown(f"_{info.get('narrative', '')}_")
 
     with tab_table:
         flags_map = st.session_state.get("flags") or {}
@@ -1053,13 +1335,30 @@ if "datapoints" in st.session_state:
 
     # ── Copilot / Claude analysis prompt ────────────────────────────────────
     with tab_copilot_prompt:
-        st.subheader("📋 Copy-paste prompt for analysis in Copilot or Claude")
+        st.subheader("📋 Copy-paste prompt for analysis in Copilot")
         st.caption(
-            "This prompt embeds the data we just pulled. Paste into Microsoft "
-            "Copilot, ChatGPT, Claude, or any other AI assistant to get a deeper "
-            "narrative analysis than what fits in the AI Audit tab."
+            "Two prompt versions are available below. The **Analysis** prompt "
+            "embeds the data this tool just pulled; paste into Copilot for "
+            "deeper narrative. The **Standalone Run** prompt mirrors the tool's "
+            "logic — paste into Copilot with NO embedded data and Copilot will "
+            "run the same analysis on any company set you ask about. This is "
+            "what to share with Con Edison staff who don't have access to this app."
         )
-        prompt_text = _build_analysis_prompt(dps, flags_map)
+
+        prompt_mode = st.radio(
+            "Prompt version",
+            options=["Analysis (this run's data embedded)",
+                     "Standalone Run (no data — analyst types companies/metrics into Copilot)"],
+            horizontal=False,
+        )
+
+        if prompt_mode.startswith("Analysis"):
+            prompt_text = _build_analysis_prompt(dps, flags_map)
+            filename = "copilot_analysis_prompt.txt"
+        else:
+            prompt_text = _build_standalone_copilot_prompt()
+            filename = "copilot_standalone_prompt.txt"
+
         st.text_area(
             "Prompt (click into the box, ⌘/Ctrl+A to select all, ⌘/Ctrl+C to copy)",
             value=prompt_text,
@@ -1068,7 +1367,7 @@ if "datapoints" in st.session_state:
         st.download_button(
             "Download as .txt",
             data=prompt_text.encode("utf-8"),
-            file_name="copilot_analysis_prompt.txt",
+            file_name=filename,
             mime="text/plain",
         )
 
