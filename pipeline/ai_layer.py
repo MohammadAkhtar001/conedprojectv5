@@ -82,7 +82,7 @@ Write 2–4 sentences summarizing data quality, then list any specific values yo
 
     try:
         msg = client.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model="claude-sonnet-4-6",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -127,7 +127,7 @@ Return a markdown bullet list. Use **bold** for headlines."""
 
     try:
         msg = client.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model="claude-sonnet-4-6",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -138,6 +138,188 @@ Return a markdown bullet list. Use **bold** for headlines."""
 
 
 # ── Quality scan: per-value flags ────────────────────────────────────────────
+
+
+def apply_cross_source_bonus(datapoints: list[DataPoint]) -> None:
+    """Cross-source agreement boost: when an extracted value is corroborated
+    by attempts from two or more independent source families AND the
+    values agree within 10%, raise the confidence by +0.05 (capped at 0.99).
+
+    This rewards data points where multiple sources independently confirmed
+    the number — a signal of correctness much stronger than any single
+    source's tier.
+
+    Mutates datapoints in place.  Adds a sentence to the .notes field
+    describing the corroboration when applied.
+    """
+    for dp in datapoints:
+        if not dp.ok or dp.value is None or dp.confidence_score is None:
+            continue
+        # Look at attempts that succeeded with a numeric response and a
+        # different source family than the one that produced dp
+        primary_source = (dp.source_name or "").split(" ")[0].lower()
+        corroborators: list[tuple[str, float]] = []
+        for a in dp.attempts:
+            if not a.success:
+                continue
+            other_source = (a.source or "").split(" ")[0].lower()
+            if other_source == primary_source or not other_source:
+                continue
+            # Try to parse a number from the response_preview
+            import re
+            for m in re.finditer(r"[-+]?\d+(?:\.\d+)?", a.response_preview or ""):
+                try:
+                    n = float(m.group(0))
+                    # Only consider numbers in the same order of magnitude
+                    if dp.value > 0 and 0.1 <= (n / dp.value) <= 10:
+                        corroborators.append((other_source, n))
+                        break
+                except ValueError:
+                    pass
+
+        # Are any corroborators within 10% of dp.value?
+        agreed = [
+            (src, n) for src, n in corroborators
+            if abs(n - dp.value) / max(abs(dp.value), 1e-9) <= 0.10
+        ]
+        if agreed:
+            old_conf = dp.confidence_score
+            dp.confidence_score = min(0.99, old_conf + 0.05)
+            sources_agreeing = ", ".join(sorted(set(s for s, _ in agreed)))
+            cross_note = (f"Cross-source agreement bonus: corroborated by "
+                          f"{sources_agreeing} (Δ ≤ 10%); confidence "
+                          f"raised {old_conf:.2f} → {dp.confidence_score:.2f}.")
+            dp.notes = ((dp.notes or "") + " | " + cross_note).strip(" |")
+
+
+def compute_standing(
+    datapoints: list[DataPoint], focus_company: str = "Con Edison"
+) -> dict[str, dict]:
+    """For each metric, compute where the focus company stands vs peers.
+
+    Returns: {metric_key: {
+        "focus_value":     <focus company's value or None>,
+        "rank":            <1-based rank, 1 = best>,
+        "of_total":        <total companies with values>,
+        "peer_median":     <median across peers>,
+        "peer_average":    <mean across peers>,
+        "best":            (company_name, value),
+        "worst":           (company_name, value),
+        "vs_median_pct":   <percentage above/below peer median>,
+        "verdict":         "Top performer" | "Above median" | "Median" | "Below median" | "Lowest" | "No data",
+        "narrative":       "<one-line plain-English summary>",
+    }}
+
+    "Best" honors lower_is_better — for SAIDI and carbon emissions, lower is better.
+    """
+    from .models import METRICS as _M
+
+    standings: dict[str, dict] = {}
+    metrics_seen: set[str] = set()
+    for dp in datapoints:
+        metrics_seen.add(dp.metric)
+
+    focus_lower = focus_company.lower()
+
+    for metric in metrics_seen:
+        meta = _M.get(metric, {})
+        lower_better = meta.get("lower_is_better", False)
+        label = meta.get("label", metric)
+
+        # All values for this metric
+        values = []
+        focus_dp = None
+        for dp in datapoints:
+            if dp.metric != metric:
+                continue
+            if dp.company.lower() == focus_lower:
+                focus_dp = dp
+            if dp.ok and dp.value is not None:
+                values.append((dp.company, dp.value))
+
+        if not values:
+            standings[metric] = {
+                "focus_value": None, "rank": None, "of_total": 0,
+                "peer_median": None, "peer_average": None,
+                "best": None, "worst": None, "vs_median_pct": None,
+                "verdict": "No data",
+                "narrative": f"No {label} values were retrieved for any company in this run.",
+            }
+            continue
+
+        # Sort by value: best first (smallest if lower_better, else largest)
+        values_sorted = sorted(values, key=lambda x: x[1], reverse=not lower_better)
+        n = len(values_sorted)
+
+        focus_value = focus_dp.value if (focus_dp and focus_dp.ok) else None
+        rank = None
+        if focus_value is not None:
+            for i, (c, v) in enumerate(values_sorted, 1):
+                if c.lower() == focus_lower:
+                    rank = i
+                    break
+
+        # Peer-only stats (exclude focus company)
+        peer_vals = [v for c, v in values_sorted if c.lower() != focus_lower]
+        peer_median = (sorted(peer_vals)[len(peer_vals) // 2]
+                       if peer_vals else None)
+        peer_average = (sum(peer_vals) / len(peer_vals)) if peer_vals else None
+
+        vs_median_pct = None
+        if focus_value is not None and peer_median:
+            vs_median_pct = ((focus_value - peer_median) / peer_median) * 100
+
+        # Verdict
+        verdict = "No data"
+        narrative = ""
+        if focus_value is None:
+            verdict = "No data"
+            narrative = f"{focus_company} has no value for {label}."
+        elif n == 1:
+            verdict = "Only data point"
+            narrative = f"{focus_company} is the only company with a value for {label}."
+        elif rank == 1:
+            verdict = "Top performer"
+            narrative = (
+                f"{focus_company} ranks #1 of {n} on {label} "
+                f"({focus_value:g} {meta.get('unit','')}), "
+                f"{'lowest' if lower_better else 'highest'} in the peer set."
+            )
+        elif rank == n:
+            verdict = "Lowest"
+            narrative = (
+                f"{focus_company} ranks last (#{n} of {n}) on {label} "
+                f"({focus_value:g} {meta.get('unit','')}). "
+                f"Peer leader: {values_sorted[0][0]} at {values_sorted[0][1]:g}."
+            )
+        else:
+            top_half = rank <= n // 2
+            verdict = "Above median" if top_half else "Below median"
+            ratio_text = ""
+            if vs_median_pct is not None:
+                if vs_median_pct >= 0:
+                    ratio_text = f"{abs(vs_median_pct):.0f}% above peer median"
+                else:
+                    ratio_text = f"{abs(vs_median_pct):.0f}% below peer median"
+            narrative = (
+                f"{focus_company} ranks #{rank} of {n} on {label} "
+                f"({focus_value:g} {meta.get('unit','')}) — {ratio_text}."
+            )
+
+        standings[metric] = {
+            "focus_value": focus_value,
+            "rank": rank,
+            "of_total": n,
+            "peer_median": peer_median,
+            "peer_average": peer_average,
+            "best": values_sorted[0] if values_sorted else None,
+            "worst": values_sorted[-1] if values_sorted else None,
+            "vs_median_pct": vs_median_pct,
+            "verdict": verdict,
+            "narrative": narrative,
+        }
+
+    return standings
 
 
 def rule_based_flags(datapoints: list[DataPoint]) -> dict[tuple[str, str], dict]:
@@ -358,28 +540,46 @@ def ai_quality_scan(datapoints: list[DataPoint]) -> Optional[dict[tuple[str, str
     if not rows:
         return None
 
-    prompt = f"""You are an experienced utility-industry data analyst auditing a freshly compiled benchmark. For EACH row below, decide if the value looks correct.
+    prompt = f"""You are an experienced utility-industry data analyst auditing a freshly compiled benchmark.  Be skeptical.  Your job is to catch errors before they reach an executive deck.
+
+For EACH row below, decide if the value looks correct.
 
 Output a single JSON object: a map keyed by "company||metric" (use double-pipe), value is {{"flag": "✅"|"⚠️"|"🚩", "reason": "<one short sentence>"}}.
 
 Use:
-  ✅  value looks correct and from a credible source
-  ⚠️  value is plausible but has a caveat (partial coverage, dated, methodology mismatch)
-  🚩  value looks wrong (off by an order of magnitude, wrong unit, implausibly small/large for company size)
+  ✅  Value looks correct and from a credible source
+  ⚠️  Value is plausible but has a caveat (partial coverage, dated, methodology mismatch, foundation-only when total was implied)
+  🚩  Value looks WRONG.  Specifically check for:
+        - Order-of-magnitude error (e.g. revenue showing as $15,000B instead of $15B — likely $ vs $B confusion)
+        - Year number bleeding into a value field (e.g. revenue=2024, charitable_giving=2023 — check if the value matches the year field)
+        - Unit confusion ($M vs $B, hours vs days, % stored as 0.42 when displayed as 42)
+        - Implausibly tiny value for a company that size (e.g. Con Edison Revenue = $0.05B is wrong; it's a $15B company)
+        - Implausibly large value for what's being measured
+        - A number that's exactly the same across multiple companies (suggesting a copy-paste or unit-default error)
+        - Outliers ≥5× peer median when the metric is normally tightly clustered (philanthropy, customer satisfaction)
 
-Structural facts that are NOT errors (so do not flag for these):
-- Integrated generators (Duke, Southern, Dominion, PG&E) emit ~10× more Scope 1 CO₂ than pure distributors (Con Edison, National Grid USA, Eversource).
-- Foundation grants paid varies year-to-year; small amounts in off-years can be real.
-- Pure T&D distributors legitimately have null/zero eGRID Scope 1 emissions (no owned generation).
+Structural facts that are NOT errors (do not flag):
+- Integrated generators (Duke, Southern, Dominion, PG&E) emit ~10× more Scope 1 CO₂ than pure distributors. That is structural, not an outlier.
+- Foundation grants paid varies year-to-year; small amounts in off-years (down to a few thousand dollars) are real.
+- Customer-satisfaction scores cluster tightly around 50/100; a 1-2 point gap IS meaningful but is NOT a 🚩.
 
-Rows:
+Reference ranges (use these to spot-check):
+- Revenue: $5–60B for large IOUs
+- Foundation grants paid: $0.1–20M
+- Foundation assets: $5–150M
+- Carbon Emissions Scope 1 (generator): 30–120 M MT CO2; (distributor): 0–5 M MT CO2 (usually 0)
+- Customer satisfaction: 45–80 / 100
+- Renewable %: 5–60%
+- SAIDI: 50–300 min/yr (more for storm-prone utilities)
+
+Rows to audit:
 {json.dumps(rows, indent=2, default=str)}
 
-Return ONLY the JSON object — no prose, no markdown fences."""
+Return ONLY the JSON object.  No prose.  No markdown fences."""
 
     try:
         msg = client.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model="claude-sonnet-4-6",
             max_tokens=3000,
             messages=[{"role": "user", "content": prompt}],
         )
