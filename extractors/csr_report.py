@@ -34,6 +34,7 @@ piece of HTML scraping a human (or AI) needs to maintain.
 
 from __future__ import annotations
 import logging
+import os
 import re
 from typing import Iterable, Optional
 
@@ -112,6 +113,89 @@ def _normalize_number(raw: str, magnitude: Optional[str]) -> float:
     return n
 
 
+# Cache discovered URLs across pipeline runs (per Python process)
+_DISCOVERED_URLS: dict[str, Optional[str]] = {}
+
+
+def _discover_csr_url(company: Company) -> Optional[str]:
+    """Use Claude + web_search to find a current sustainability/CSR report
+    URL for a company that isn't in CSR_URL_HINTS.  Caches the result.
+
+    Returns None if AI is unavailable, search fails, or no credible URL
+    is found.  Never returns a guess — only URLs Claude found via search.
+    """
+    cache_key = company.name.lower()
+    if cache_key in _DISCOVERED_URLS:
+        return _DISCOVERED_URLS[cache_key]
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key or api_key.startswith("sk-ant-...") or len(api_key) < 20:
+        _DISCOVERED_URLS[cache_key] = None
+        return None
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key)
+    except ImportError:
+        _DISCOVERED_URLS[cache_key] = None
+        return None
+
+    prompt = f"""Find the URL for the most recent corporate sustainability / CSR / ESG report PDF or landing page for this US utility:
+
+Company: **{company.name}**
+{f'Aliases: {", ".join(company.aliases)}' if company.aliases else ''}
+
+Search the web. Prefer the company's own corporate website over third-party aggregators.
+
+Output a single JSON object — no prose, no markdown:
+
+{{"url": "<full URL or null>", "kind": "pdf" | "landing_page", "year": "<e.g. 2024 or null>"}}
+
+If you cannot find a credible URL on the company's own site, return null. Do NOT make up a URL."""
+
+    try:
+        # Try with web_search; fall back gracefully if not supported
+        try:
+            msg = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            )
+        except Exception:
+            msg = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+    except Exception as e:
+        log.warning("CSR URL discovery failed: %s", e)
+        _DISCOVERED_URLS[cache_key] = None
+        return None
+
+    import json as _json
+    import re as _re
+    cleaned = _re.sub(r"^```json\s*|```$", "", text or "", flags=_re.MULTILINE).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < 0:
+        _DISCOVERED_URLS[cache_key] = None
+        return None
+    try:
+        parsed = _json.loads(cleaned[start:end + 1])
+        url = parsed.get("url")
+        if isinstance(url, str) and url.startswith("http"):
+            log.info("Discovered CSR URL for %s: %s", company.name, url)
+            _DISCOVERED_URLS[cache_key] = url
+            return url
+    except _json.JSONDecodeError:
+        pass
+
+    _DISCOVERED_URLS[cache_key] = None
+    return None
+
+
 class CsrReportExtractor(Extractor):
     supplies_metrics = (
         "renewable_pct",
@@ -136,11 +220,19 @@ class CsrReportExtractor(Extractor):
 
         url = CSR_URL_HINTS.get(company.name.lower())
         if not url:
+            # Try to discover a CSR URL via AI before giving up.  This makes
+            # the tool work for companies not in CSR_URL_HINTS without
+            # manual configuration.
+            url = _discover_csr_url(company)
+        if not url:
             for m in wanted:
                 results.append(make_failure(
                     company=company.name, metric=m,
-                    reason=("no CSR URL on file for this company. "
-                            "Add an entry to CSR_URL_HINTS in extractors/csr_report.py."),
+                    reason=("no CSR URL on file for this company and AI URL "
+                            "discovery did not find one. Either add an entry "
+                            "to CSR_URL_HINTS in extractors/csr_report.py, or "
+                            "ensure ANTHROPIC_API_KEY is set so AI can search "
+                            "for the report URL."),
                     attempts=[],
                 ))
             return results
