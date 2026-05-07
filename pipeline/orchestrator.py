@@ -117,11 +117,16 @@ def run_pipeline(
 ) -> list[DataPoint]:
     """Main entry point.  Returns one DataPoint per (company, metric).
 
-    use_ai_fallback: if None, auto-detect from ANTHROPIC_API_KEY env var.
+    use_ai_fallback: if None, auto-detect from ANTHROPIC_API_KEY or
+                     GOOGLE_API_KEY env vars.
     """
     if use_ai_fallback is None:
-        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        use_ai_fallback = bool(key) and not key.startswith("sk-ant-...")
+        anth_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        gem_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        use_ai_fallback = (
+            (bool(anth_key) and not anth_key.startswith("sk-ant-..."))
+            or (bool(gem_key) and len(gem_key) >= 20)
+        )
 
     results: list[DataPoint] = []
 
