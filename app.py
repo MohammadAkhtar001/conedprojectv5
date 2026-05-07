@@ -85,7 +85,8 @@ except ImportError:
 # Surface import errors clearly in the Streamlit UI so deploy issues are
 # easy to diagnose, instead of "data leaks redacted" cryptic messages.
 try:
-    from pipeline.orchestrator import run_pipeline, _fuzzy_match_metric
+    from pipeline.orchestrator import (run_pipeline, _fuzzy_match_metric,
+                                        infer_metric_unit)
     from pipeline.export import to_excel
     from pipeline.ai_layer import verify, generate_insights, merged_flags
     from pipeline.models import METRICS
@@ -994,20 +995,34 @@ with st.sidebar:
             msg_lines.append(f"• Company **{n}** → matched in registry, will use structured extractors")
         for typed, matched in custom_metrics_resolved:
             label = METRICS[matched]["label"]
-            msg_lines.append(f"• Metric **{typed}** → routed to **{label}** ({matched}), will use that metric's extractor")
+            unit = METRICS[matched]["unit"]
+            msg_lines.append(
+                f"• Metric **{typed}** → routed to **{label}** ({unit}), "
+                f"will use that metric's extractor"
+            )
         st.success("These custom entries will work without AI:\n\n" + "\n\n".join(msg_lines))
 
-    # Show what genuinely needs AI
-    if (custom_companies_needing_ai or custom_metrics_needing_ai) and not use_ai:
+    # Show what genuinely needs AI — but with inferred unit/description so
+    # the user knows what the tool will look for
+    if custom_companies_needing_ai or custom_metrics_needing_ai:
         msg_lines = []
         for n in custom_companies_needing_ai:
             msg_lines.append(f"• Company **{n}** — not in registry; needs AI fallback")
         for n in custom_metrics_needing_ai:
-            msg_lines.append(f"• Metric **{n}** — no standard match; needs AI fallback")
-        st.warning(
-            "These entries need AI to find values, and AI is currently disabled. "
-            "They'll return null with that explanation:\n\n" + "\n\n".join(msg_lines)
-        )
+            inferred_unit, inferred_desc = infer_metric_unit(n)
+            unit_str = f" — inferred unit: **{inferred_unit}**" if inferred_unit else ""
+            msg_lines.append(
+                f"• Metric **{n}**{unit_str}\n  _{inferred_desc}_"
+            )
+        if not use_ai:
+            st.warning(
+                "These entries need AI to find values, and AI is currently disabled. "
+                "They'll return null:\n\n" + "\n\n".join(msg_lines)
+            )
+        else:
+            st.info(
+                "These entries will use AI fallback:\n\n" + "\n\n".join(msg_lines)
+            )
 
     run_btn = st.button("Run benchmark", type="primary", use_container_width=True,
                         disabled=not (companies and metrics))
@@ -1189,6 +1204,51 @@ if "datapoints" in st.session_state:
 
     with tab_table:
         flags_map = st.session_state.get("flags") or {}
+
+        # ── Metric glossary (collapsed by default to save space) ──────────
+        metrics_in_run = []
+        for dp in dps:
+            if dp.metric not in metrics_in_run:
+                metrics_in_run.append(dp.metric)
+
+        with st.expander("📖 Metric glossary — what each column means and its unit",
+                          expanded=True):
+            st.caption(
+                "Quick reference for every metric in this run. Standard "
+                "metrics show their official definition; custom metrics "
+                "show what unit was inferred and how the tool tried to "
+                "resolve them."
+            )
+            for m in metrics_in_run:
+                meta = METRICS.get(m)
+                if meta:
+                    label = meta["label"]
+                    unit = meta["unit"]
+                    description = meta["description"]
+                    expected = meta.get("expected_range", "n/a")
+                    direction = ("lower is better"
+                                 if meta.get("lower_is_better") else "higher is better")
+                    st.markdown(
+                        f"**{label}** _({unit})_ · _{direction}_  \n"
+                        f"{description}  \n"
+                        f"_Expected range: {expected}_"
+                    )
+                else:
+                    inferred_unit, inferred_desc = infer_metric_unit(m)
+                    matched = _fuzzy_match_metric(m)
+                    if matched:
+                        target_meta = METRICS[matched]
+                        st.markdown(
+                            f"**{m}** _({target_meta['unit']})_ · custom metric  \n"
+                            f"Routed to standard metric **{target_meta['label']}** — "
+                            f"{target_meta['description']}"
+                        )
+                    else:
+                        unit_disp = f"_({inferred_unit})_ · " if inferred_unit else ""
+                        st.markdown(
+                            f"**{m}** {unit_disp}custom metric, no fuzzy match  \n"
+                            f"_{inferred_desc}_"
+                        )
 
         st.subheader("Wide format (Companies × Metrics)")
         st.caption(
