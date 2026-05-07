@@ -842,10 +842,72 @@ with st.sidebar:
     )
 
     registry_options = [c.name for c in REGISTRY.values()]
+
+    # ── Preset peer groups — quick way to populate the company list ──────
+    # Built from the registry's metadata so we don't hardcode names twice.
+    def _preset_companies(preset: str) -> list[str]:
+        if preset == "None":
+            return registry_options[:4]   # default = first 4
+        if preset == "NY/Tristate utilities":
+            return [c.name for c in REGISTRY.values()
+                    if any(s in (c.state_puc_codes or ())
+                           for s in ("NY-PSC", "NY-DPS", "NJ-BPU"))]
+        if preset == "New England utilities":
+            return [c.name for c in REGISTRY.values()
+                    if any(s in (c.state_puc_codes or ())
+                           for s in ("CT-PURA", "MA-DPU", "RI-PUC",
+                                     "ME-PUC", "NH-PUC", "VT-PSB"))]
+        if preset == "Mid-Atlantic / PJM":
+            return [c.name for c in REGISTRY.values()
+                    if any(s in (c.state_puc_codes or ())
+                           for s in ("PA-PUC", "MD-PSC", "DC-PSC", "DE-PSC",
+                                     "VA-SCC", "NJ-BPU", "OH-PUCO", "WV-PSC"))]
+        if preset == "T&D distributors only":
+            return [c.name for c in REGISTRY.values()
+                    if not c.is_integrated_generator]
+        if preset == "Integrated generators only":
+            return [c.name for c in REGISTRY.values()
+                    if c.is_integrated_generator]
+        if preset == "Top 10 by size (mixed)":
+            # Hand-picked national peer set commonly used in benchmarking
+            wanted = {"Con Edison", "Duke Energy", "Pacific Gas and Electric",
+                      "Eversource Energy", "Exelon Corporation",
+                      "Public Service Enterprise Group", "Southern Company",
+                      "Dominion Energy", "American Electric Power",
+                      "NextEra Energy"}
+            return [c.name for c in REGISTRY.values() if c.name in wanted]
+        return registry_options[:4]
+
+    preset = st.selectbox(
+        "Preset peer group (optional)",
+        options=["None", "NY/Tristate utilities", "New England utilities",
+                 "Mid-Atlantic / PJM", "T&D distributors only",
+                 "Integrated generators only", "Top 10 by size (mixed)"],
+        index=0,
+        help=("Pick a preset to populate the company list automatically. "
+              "You can still add or remove individual companies after. "
+              "Selecting a different preset replaces the current selection."),
+    )
+    # When the preset changes, store the new default in session state so the
+    # multiselect picks it up.
+    if "_last_preset" not in st.session_state:
+        st.session_state["_last_preset"] = "None"
+    if preset != st.session_state["_last_preset"]:
+        st.session_state["_last_preset"] = preset
+        st.session_state["_preset_default"] = _preset_companies(preset)
+        st.rerun()
+
+    default_for_multiselect = st.session_state.get(
+        "_preset_default", registry_options[:4])
+    # Filter the default to only valid registry names (defensive in case the
+    # registry changed between session state writes)
+    default_for_multiselect = [n for n in default_for_multiselect
+                                if n in registry_options]
+
     selected_registry = st.multiselect(
         "From registry",
         options=registry_options,
-        default=registry_options[:4],
+        default=default_for_multiselect,
     )
 
     # ── Custom companies: input + Add button + chip list ────────────────────
